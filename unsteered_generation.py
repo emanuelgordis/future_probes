@@ -136,7 +136,12 @@ def run_behavioral_stability(
             [int(token_id) for token_id in response.token_ids]
             for response in example_output.outputs
         ]
-        if isinstance(input_ids, torch.Tensor):
+        # Prefer the token ids vLLM actually consumed; fall back to the HF
+        # chat-template tokenization (verified identical for Qwen3, which has
+        # no BOS token) for engines that do not report prompt ids.
+        if getattr(example_output, "prompt_token_ids", None):
+            prompt_token_ids = list(example_output.prompt_token_ids)
+        elif isinstance(input_ids, torch.Tensor):
             prompt_token_ids = input_ids.detach().cpu().reshape(-1).tolist()
         else:
             prompt_token_ids = list(input_ids)
@@ -188,12 +193,14 @@ def run_behavioral_stability(
                 for response in responses
             ]
         else:
+            # Split at the LAST </think>, matching Qwen3's reference parsing;
+            # a spurious early close must not leak CoT into the answer.
             thinking_contents = [
-                response.split("</think>")[0] if "</think>" in response else ""
+                response.rsplit("</think>", 1)[0] if "</think>" in response else ""
                 for response in responses
             ]
             answer_contents = [
-                response.split("</think>")[1] if "</think>" in response else response
+                response.rsplit("</think>", 1)[1] if "</think>" in response else response
                 for response in responses
             ]
 

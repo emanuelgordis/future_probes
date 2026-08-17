@@ -223,9 +223,10 @@ uv run unsteered_generation.py \
     --subset 50 --seed 42 \
     --num_samples 8 \
     --max_new_tokens 4096 \
-    --temperature 1.0
+    --temperature 1.0 \
+    --max_model_len 16384
 ```
-Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context is the model default rather than the short-prompt cap (override with `--max_model_len`).
+Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap (the 40k default does not leave enough KV-cache memory next to the bf16 weights); 16384 comfortably covers the longest transcript prefix (~7k tokens) plus generation.
 
 ## Stage 2 — Scoring answers in the Assistant Axis persona space
 
@@ -249,6 +250,8 @@ For each rollout we take the **mean residual-stream activation over the final-an
 Scoring answers (rather than thinking) also keeps the probe targets close to the distribution the artifacts were extracted from: the upstream vectors come from non-thinking response tokens [1].
 
 The artifacts are auto-downloaded from HuggingFace on first use, or pass `--assistant_axis_path` to a local copy (`assistant_axis.pt` + `role_vectors/`).
+
+**Sanity check.** A small Qwen3-32B pilot (6 prompts × 3 rollouts) reproduces the upstream drift phenomenon end-to-end through this scoring path: final-answer axis projections decline over the turns of a philosophy conversation (turn 2 ≈ −42 → turn 9 ≈ −53 → turn 13 ≈ −58) while coding/writing prefixes stay far more Assistant-like (≈ −18 to −22), matching the domain ordering reported by Lu et al. [1].
 
 ## Stage 3 — CoT activations at step boundaries
 
@@ -300,13 +303,13 @@ This writes a single `…_persona_activations.pt` (version-1 format):
 
 ### Probe
 
-For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average). Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
+For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average); rollouts whose first sentence ends after *t* are excluded from that cell rather than represented by a future state, so early checkpoints never see later reasoning. Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
 
 ### Evaluations: cross-prompt and within-prompt
 
 Two complementary splits, mirroring the two sources of variation in the data:
 
-- **`cross_prompt`** holds out entire prompts (or entire conversations with `--cross-group conversation`, which is stricter because prefixes of one conversation overlap heavily). This measures whether a probe transfers to unseen conversations — grouped held-out evaluation guards against the probe memorizing prompt identity, one of the standard confounds in probing methodology [4, 9].
+- **`cross_prompt`** holds out entire conversations by default (`--cross-group conversation`): because persona-drift prompts are nested prefixes of one transcript, holding out single prompts (`--cross-group prompt`) would leak conversation identity between train and evaluation. This measures whether a probe transfers to unseen conversations — grouped held-out evaluation guards against the probe memorizing prompt or conversation identity, one of the standard confounds in probing methodology [4, 9].
 - **`within_prompt`** holds out stochastic rollouts *inside* each prompt, and centers both activations and targets by their *training-rollout* prompt means. Metrics are computed in this prompt-residual space, so the probe only gets credit for predicting *which way this particular rollout deviates* from the prompt's average persona — the per-question analogue of how self-verification probes predict the outcome of an individual reasoning trajectory [11, 12].
 
 ### Baselines and controls

@@ -68,7 +68,9 @@ def parse_thinking_and_answer_spans(text: str) -> tuple[CharSpan, CharSpan]:
     content, a mandatory ``</think>`` closer, then the public final answer.
     """
 
-    think_end_index = text.find(THINK_END_TAG)
+    # Qwen3's reference parsing locates the LAST </think> token; a spurious
+    # early close would otherwise leak the remaining CoT into the answer span.
+    think_end_index = text.rfind(THINK_END_TAG)
     if think_end_index < 0:
         raise RolloutSkipped("thinking never closed (no </think> in rollout)")
 
@@ -151,8 +153,11 @@ class TokenTextAligner:
 
     The fast path re-encodes the decoded text and uses the fast tokenizer's
     offset mapping, accepted only when it reproduces the generated ids exactly.
-    Otherwise a binary search over cumulative prefix-decode lengths is used,
-    which is exact with respect to the decode that produced ``text``.
+    Otherwise a binary search over prefix decodes is used, where a prefix's
+    coverage is the length of its longest exact match with ``text``.  Comparing
+    against ``text`` (rather than trusting ``len(decode(prefix))``) matters for
+    multibyte characters split across tokens: a dangling-byte prefix decodes to
+    U+FFFD replacement characters that inflate the raw length.
     """
 
     def __init__(self, tokenizer, token_ids: Sequence[int], text: str) -> None:
@@ -176,11 +181,22 @@ class TokenTextAligner:
             self._token_start_offsets = None
 
     def _prefix_length(self, n_tokens: int) -> int:
+        """Number of leading ``text`` characters fully produced by ``n_tokens``."""
+
         if n_tokens not in self._prefix_length_cache:
             decoded = self.tokenizer.decode(
                 self.token_ids[:n_tokens], clean_up_tokenization_spaces=False
             )
-            self._prefix_length_cache[n_tokens] = len(decoded)
+            if self.text.startswith(decoded):
+                covered = len(decoded)
+            else:
+                # Dangling UTF-8 bytes decode to U+FFFD; count only the exactly
+                # matching prefix so incomplete characters are not credited.
+                limit = min(len(decoded), len(self.text))
+                covered = 0
+                while covered < limit and decoded[covered] == self.text[covered]:
+                    covered += 1
+            self._prefix_length_cache[n_tokens] = covered
         return self._prefix_length_cache[n_tokens]
 
     def token_index_covering(self, char_end: int) -> int:

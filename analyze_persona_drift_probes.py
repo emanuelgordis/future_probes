@@ -30,8 +30,10 @@ For every layer and normalized reasoning checkpoint, a multi-output ridge (or
 ordinary linear) regressor predicts the final answer's Assistant Axis scalar and
 selected persona coordinates.  Two complementary evaluations are reported:
 
-* ``cross_prompt`` holds out complete prompt groups.  ``--cross-group
-  conversation`` is stricter and holds out every prefix from a conversation.
+* ``cross_prompt`` holds out complete groups.  The default ``--cross-group
+  conversation`` holds out every prefix of a conversation, since prefixes of
+  one transcript overlap heavily; ``--cross-group prompt`` is a deliberately
+  weaker variant that only holds out individual prompts.
 * ``within_prompt`` holds out stochastic rollouts inside every prompt.  Both
   activations and targets are centered using *training rollouts only*, so this
   measures whether activation deviations predict persona deviations rather than
@@ -42,6 +44,10 @@ The prompt-mean baseline only uses training labels (and falls back to the global
 training mean for unseen prompts).  The shuffled baseline refits the same probe
 after shuffling targets globally for cross-prompt evaluation and within each
 prompt for within-prompt evaluation.
+
+Rollouts whose first CoT boundary lies after a checkpoint are excluded from that
+checkpoint's cell (never represented by a later state), so early-time results
+cannot leak future reasoning states.
 """
 
 from __future__ import annotations
@@ -385,22 +391,34 @@ def checkpoint_activations(
     layer: int,
     checkpoints: np.ndarray,
     representation: str,
-) -> np.ndarray:
-    """Sample a variable-length CoT trajectory at normalized checkpoints."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample a variable-length CoT trajectory at normalized checkpoints.
+
+    Returns ``(states, valid)``.  ``valid[j]`` is False when the rollout has no
+    boundary at or before checkpoint ``j`` — such cells must be excluded rather
+    than filled with a later state, which would leak future reasoning into an
+    earlier checkpoint.  Invalid rows of ``states`` are zero-filled.
+    """
 
     activations = trajectory.layer_activations[layer]
     progress = trajectory.progress
     sampled: list[np.ndarray] = []
+    valid: list[bool] = []
     for checkpoint in checkpoints:
         eligible = np.flatnonzero(progress <= checkpoint + 1e-9)
-        boundary_index = int(eligible[-1]) if len(eligible) else 0
+        if not len(eligible):
+            sampled.append(np.zeros_like(activations[0]))
+            valid.append(False)
+            continue
+        boundary_index = int(eligible[-1])
+        valid.append(True)
         if representation == "latest":
             sampled.append(activations[boundary_index])
         elif representation == "cumulative_mean":
             sampled.append(activations[: boundary_index + 1].mean(axis=0))
         else:
             raise ValueError(f"Unknown trajectory representation: {representation}")
-    return np.stack(sampled)
+    return np.stack(sampled), np.asarray(valid, dtype=bool)
 
 
 def select_persona_coordinates(
@@ -768,23 +786,55 @@ def run_analysis(
     for layer in layers:
         if any(layer not in trajectory.layer_activations for trajectory in trajectories):
             raise ValueError(f"Layer {layer} is not present for every usable rollout")
+        sampled_with_validity = [
+            checkpoint_activations(
+                trajectory, layer, checkpoints, trajectory_representation
+            )
+            for trajectory in trajectories
+        ]
         sampled = np.stack(
-            [
-                checkpoint_activations(
-                    trajectory, layer, checkpoints, trajectory_representation
-                )
-                for trajectory in trajectories
-            ]
+            [states for states, _ in sampled_with_validity]
         )  # (rollouts, time_bins, hidden)
+        valid = np.stack(
+            [validity for _, validity in sampled_with_validity]
+        )  # (rollouts, time_bins)
         for time_bin, checkpoint in enumerate(checkpoints):
             X = sampled[:, time_bin, :].astype(np.float64, copy=False)
+            cell_valid = valid[:, time_bin]
             for split_offset, split_kind in enumerate(split_kinds):
                 probe_runs: list[dict[str, Any]] = []
                 prompt_mean_runs: list[dict[str, Any]] = []
                 global_mean_runs: list[dict[str, Any]] = []
                 shuffled_runs: list[dict[str, Any]] = []
                 diagnostics = []
-                for repeat, split in enumerate(split_plans[split_kind]):
+                for repeat, full_split in enumerate(split_plans[split_kind]):
+                    # Rollouts with no CoT boundary by this checkpoint are
+                    # excluded from the cell instead of being represented by a
+                    # future state.
+                    train = full_split.train[cell_valid[full_split.train]]
+                    evaluation = full_split.evaluation[
+                        cell_valid[full_split.evaluation]
+                    ]
+                    if split_kind == "within_prompt" and len(train):
+                        train_prompts = set(prompt_ids[train].tolist())
+                        evaluation = np.asarray(
+                            [
+                                index
+                                for index in evaluation
+                                if prompt_ids[index] in train_prompts
+                            ],
+                            dtype=int,
+                        )
+                    if not len(train) or not len(evaluation):
+                        diagnostics.append(
+                            {
+                                "repeat": repeat,
+                                "skipped": "no valid rollouts at this checkpoint",
+                                "n_excluded_no_boundary": int(np.sum(~cell_valid)),
+                            }
+                        )
+                        continue
+                    split = SplitIndices(train=train, evaluation=evaluation)
                     (
                         predictions,
                         prompt_baseline,
@@ -853,6 +903,7 @@ def run_analysis(
                             "n_evaluation_prompts": int(
                                 len(np.unique(prompt_ids[split.evaluation]))
                             ),
+                            "n_excluded_no_boundary": int(np.sum(~cell_valid)),
                             "prompt_mean_training_coverage": float(coverage),
                         }
                     )
@@ -875,8 +926,8 @@ def run_analysis(
                             "target_shuffled_probe": summarize_metric_runs(shuffled_runs),
                         },
                         "split_diagnostics": diagnostics,
-                        "n_probe_fits": split_repeats,
-                        "n_shuffled_fits": split_repeats * shuffle_repeats,
+                        "n_probe_fits": len(probe_runs),
+                        "n_shuffled_fits": len(shuffled_runs),
                     }
                 )
     return results
@@ -947,8 +998,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cross-group",
         choices=("prompt", "conversation"),
-        default="prompt",
-        help="Grouping unit held out by cross_prompt evaluation",
+        default="conversation",
+        help=(
+            "Grouping unit held out by cross_prompt evaluation. Persona-drift "
+            "prompts are nested prefixes of one conversation, so 'conversation' "
+            "(default) prevents the probe from exploiting conversation identity; "
+            "'prompt' is a weaker, deliberately leaky variant."
+        ),
     )
     parser.add_argument("--evaluation-fraction", type=float, default=0.2)
     parser.add_argument("--split-repeats", type=int, default=1)

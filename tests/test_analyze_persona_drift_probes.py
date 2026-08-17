@@ -146,3 +146,74 @@ class PersonaDriftProbeAnalysisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CheckpointExclusionTest(unittest.TestCase):
+    """Early checkpoints must exclude rollouts, never borrow future states."""
+
+    def test_checkpoint_activations_reports_validity(self):
+        from analyze_persona_drift_probes import checkpoint_activations
+        from analyze_persona_drift_probes import RolloutTrajectory
+
+        trajectory = RolloutTrajectory(
+            prompt_id="p", conversation_id="c", rollout_id="r",
+            layer_activations={0: np.arange(6, dtype=np.float64).reshape(2, 3)},
+            progress=np.asarray([0.6, 1.0]),
+            assistant_axis=0.0,
+            persona_coordinates=np.zeros(1),
+        )
+        states, valid = checkpoint_activations(
+            trajectory, 0, np.asarray([0.5, 1.0]), "latest"
+        )
+        self.assertEqual(valid.tolist(), [False, True])
+        self.assertTrue((states[0] == 0).all())  # no future state leaked
+        np.testing.assert_array_equal(states[1], [3.0, 4.0, 5.0])
+
+    def test_late_first_boundary_rollouts_are_excluded_from_early_bins(self):
+        from analyze_persona_drift_probes import run_analysis
+
+        rng = np.random.default_rng(0)
+        trajectories = []
+        for prompt_index in range(4):
+            for rollout_index in range(3):
+                target = float(prompt_index) + 0.1 * rollout_index
+                # First boundary only at 60% of thinking: bin t=0.5 has no state.
+                activations = np.stack([
+                    np.asarray([target, 1.0, rng.normal()]),
+                    np.asarray([target, 2.0, rng.normal()]),
+                ])
+                trajectories.append(
+                    __import__("analyze_persona_drift_probes").RolloutTrajectory(
+                        prompt_id=f"p{prompt_index}",
+                        conversation_id=f"c{prompt_index % 2}",
+                        rollout_id=f"p{prompt_index}r{rollout_index}",
+                        layer_activations={0: activations.astype(np.float64)},
+                        progress=np.asarray([0.6, 1.0]),
+                        assistant_axis=target,
+                        persona_coordinates=np.asarray([target]),
+                    )
+                )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=2,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="prompt",
+            evaluation_fraction=0.25, split_repeats=1, regressor="ridge",
+            ridge_alpha=1e-6, shuffle_repeats=1, seed=0,
+        )
+        early = next(r for r in results if r["time_bin"] == 0)
+        late = next(r for r in results if r["time_bin"] == 1)
+        # All rollouts lack a boundary at t=0.5 -> the early cell has no fits.
+        self.assertEqual(early["n_probe_fits"], 0)
+        self.assertEqual(
+            early["split_diagnostics"][0]["skipped"],
+            "no valid rollouts at this checkpoint",
+        )
+        self.assertEqual(late["n_probe_fits"], 1)
+        self.assertEqual(late["split_diagnostics"][0]["n_excluded_no_boundary"], 0)
+        self.assertGreater(late["metrics"]["probe"]["assistant_axis"]["r2"]["mean"], 0.9)
+
+    def test_cross_group_default_is_conversation(self):
+        from analyze_persona_drift_probes import build_argument_parser
+
+        args = build_argument_parser().parse_args(["--activations", "x.pt"])
+        self.assertEqual(args.cross_group, "conversation")

@@ -271,3 +271,51 @@ class ResolveLayersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultibyteFallbackTokenizer:
+    """Simulates byte-level BPE: a split emoji decodes to U+FFFD replacement."""
+
+    all_special_ids = ()
+
+    # token 2 holds the emoji's first bytes, token 3 the rest.
+    _decodes = {
+        (0,): "Hi!",
+        (0, 1): "Hi! ",
+        (0, 1, 2): "Hi! �",
+        (0, 1, 2, 3): "Hi! \U0001F60A",
+    }
+
+    def decode(self, token_ids, **kwargs):
+        return self._decodes[tuple(token_ids)]
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError("no offset mapping")  # force the fallback path
+
+
+class MultibyteAlignerTest(unittest.TestCase):
+    def test_dangling_bytes_are_not_credited_to_earlier_tokens(self):
+        tokenizer = MultibyteFallbackTokenizer()
+        ids = [0, 1, 2, 3]
+        text = tokenizer.decode(ids)
+        aligner = TokenTextAligner(tokenizer, ids, text)
+        self.assertIsNone(aligner._token_start_offsets)
+        # The emoji (last char) is only complete once token 3 is decoded; a raw
+        # len(decode(...)) comparison would wrongly return token 2 because the
+        # dangling bytes decode to a same-length U+FFFD.
+        self.assertEqual(aligner.token_index_covering(len(text)), 3)
+        self.assertEqual(aligner.token_index_covering(3), 0)
+
+
+class LastThinkCloseTest(unittest.TestCase):
+    def test_split_uses_last_think_close(self):
+        text = (
+            "<think>\nEarly thought.\n</think>\nMore hidden reasoning."
+            "\n</think>\n\nPublic answer."
+        )
+        thinking, answer = parse_thinking_and_answer_spans(text)
+        self.assertEqual(
+            text[thinking.start : thinking.end],
+            "Early thought.\n</think>\nMore hidden reasoning.",
+        )
+        self.assertEqual(text[answer.start : answer.end], "Public answer.")
