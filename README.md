@@ -1,177 +1,26 @@
-# Predicting Future Behaviors in Reasoning Models Enables Better Steering
-[Evgenii Kortukov](https://kortukov.github.io/), [Piotr Komorowski](https://www.linkedin.com/in/piotr-komorowski/), [Florian Klein](https://www.linkedin.com/in/florian-klein-76a40a25a/), [Paula Engl](https://www.linkedin.com/in/paula-engl/), [Gabriele Sarti](https://gsarti.com/), [Seong Joon Oh](https://seongjoonoh.com/), [Sebastian Lapuschkin](https://iphome.hhi.de/lapuschkin/), [Wojciech Samek](https://iphome.hhi.de/samek/)
+# CoT Persona Probes
 
-**TL;DR:** Extracting latent LLM features that encode future behaviors enables a novel, non-invasive form of text-level steering.
+**Do a reasoning model's chain-of-thought activations predict the persona its final answer will express?**
 
-Read our paper here: [https://openreview.net/forum?id=48NnVTsirb](https://openreview.net/forum?id=48NnVTsirb)
+While a reasoning model thinks, its final answer does not exist yet — but its hidden states might already encode *which persona is about to speak*. This project generates rollouts for conversations that naturally pull Qwen3-32B away from its default Assistant persona, scores each final answer in the Assistant Axis persona space of Lu et al. [1], collects chain-of-thought (CoT) activations at sentence boundaries, and fits probes that predict the answer's persona coordinates from the CoT — across layers and reasoning time.
 
-![Teaser figure](./data/fpcg_teaser_v2_compressed.png)
+This repository is a fork of the [future-probes codebase](https://github.com/kortukov/future_probes) (Kortukov et al. [2]); see the upstream repository for the original behavior-distribution and future-probe steering experiments. Everything below documents this fork's persona pipeline.
 
-This repository contains two lines of experiments:
+## Motivation
 
-1. **Future behavior probes** ([Part I](#part-i-future-behavior-probes-and-fpcg)) — the experiments of the paper above: estimating per-sentence *future behavior distributions* of reasoning models by resampling rollouts, training linear probes that predict those distributions from intermediate chain-of-thought (CoT) activations, and using the probes for text-level steering (FPCG).
-2. **CoT persona probes** ([Part II](#part-ii-do-cot-activations-predict-the-persona-of-the-final-answer)) — an extension that asks whether CoT activations predict a *continuous, multi-dimensional* property of the eventual answer: the **persona** expressed in it, measured in the Assistant Axis persona space of Lu et al. [1].
-
-## Installation
-We use `uv` to manage the environment. You can install it [as described here](https://docs.astral.sh/uv/getting-started/installation/).
-
-To create the environment, run the following command in the project root:
-```bash
-uv sync
-```
-
-## Data and Demo
-- All data produced by the original paper can be downloaded from [HuggingFace](https://huggingface.co/future-probes).
-- Additionally, we provide [an interactive demo and data exploration tool](https://behavior-distributions-demo.github.io/).
-
----
-
-# Part I: Future behavior probes and FPCG
-
-## Behavior Distribution Analysis
-
-For each prompt, we sample several base responses, split each response into sentences, and for every sentence prefix we resample many continuation rollouts. The fraction of rollouts that exhibit a target behavior is that sentence's *future behavior probability* — the same resampling-rollout logic that Thought Anchors uses to attribute outcomes to individual CoT sentences [10].
-
-To gather the ground truth behavior distribution dynamics for a dataset, run:
-```bash
-uv run behavior_distribution_analysis.py \
-    --model_name deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
-    --dataset myopic_reward \
-    --subset 100 \
-    --max_new_tokens 8192 \
-    --num_base_responses 10 \
-    --num_samples 30 \
-    --seed 42
-```
-We use negative seeds to get the non-overlapping test dataset, so to get test set results, use `--seed -42`.
-In the paper, we use the datasets `myopic_reward`, `wealth_seeking`, `survival_instinct`, `sorrybench`, `sep`, and `elephant_aita`.
-
-This stage of analysis generates the ground truth data for probing and FPCG.
-This data is saved in the `results/per_sentence_probabilities` directory.
-
-## Internal Representation of Output Behavior Distributions
-
-### Predicting Future Behavior Distributions
-
-This is done in three steps - gather activations, train the probe and evaluate it.
-
-#### Gather Activations
-We gather activations at the token positions at the end of each sentence in CoT and the response, with the label being the probability of a future behavior.
-
-We run activation gathering for the training and test datasets.
-```bash
-uv run gather_activations.py --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_results.json --layer 25
-uv run gather_activations.py --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s-42_t1.0_results.json --layer 25
-```
-
-#### Train the Linear Probe
-```bash
-uv run train_probe.py --activations results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25/activations.pt
-```
-
-#### Evaluate the Probe
-```bash
-uv run evaluate_probe.py \
- --probe results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25/probabilistic_linear_probe.pt \
- --activations results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s-42_t1.0_activations/layer25/activations.pt \
- --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s-42_t1.0_results.json  --reasoning_parts
-```
-
-You can find the results in `results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25/linear_probe_predictions`.
-
-### Difference between Detection and Prediction Features
-
-To get detection features, we first gather the response activations from the same Behavior Distribution Analysis data.
-```bash
-uv run gather_activations.py --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_results.json   --layer 25 --response_only
-```
-Train the probe on them:
-```bash
-uv run train_probe.py --activations results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25_response_only/activations.pt
-```
-and evaluate it on the same test set as before:
-```bash
-uv run evaluate_probe.py \
- --probe results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25_response_only/probabilistic_linear_probe.pt \
- --activations results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s-42_t1.0_activations/layer25/activations.pt \
- --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s-42_t1.0_results.json  --reasoning_parts
-```
-
-## Future Probe Controlled Generation
-
-In this section, we use the future probes to steer the model during generation.
-We first generate the unsteered generations.
-```bash
-uv run unsteered_generation.py --model_name deepseek-ai/DeepSeek-R1-Distill-Llama-8B --dataset myopic_reward --subset 100 --num_samples 10 --max_new_tokens 8192 --multi_gpu True --seed -42 --temperature 1.0
-```
-This saves results to `results/behavioral_stability/DeepSeek-R1-Distill-Llama-8B/base_model/myopic_reward/n100_nsamp10_l8192_gumbel_s-42_ss42_t1.0_results.json`.
-
-Steering with FPCG:
-
-**Positive steering**
-```bash
-uv run future_probe_controlled_generation.py \
---probe results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25/probabilistic_linear_probe.pt \
---results results/behavioral_stability/DeepSeek-R1-Distill-Llama-8B/base_model/myopic_reward/n100_nsamp10_l8192_gumbel_s-42_ss42_t1.0_results.json \
---layer 25 \
---verbose True --negative False
-```
-
-**Negative steering**
-```bash
-uv run future_probe_controlled_generation.py \
---probe results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_activations/layer25/probabilistic_linear_probe.pt \
---results results/behavioral_stability/DeepSeek-R1-Distill-Llama-8B/base_model/myopic_reward/n100_nsamp10_l8192_gumbel_s-42_ss42_t1.0_results.json \
---layer 25 \
---verbose True --negative True
-```
-
-## Comparison with activation-based steering
-As a baseline standard steering technique, we compute a difference-in-means steering vector [7, 8] and use it to steer the model.
-
-We start by computing the difference-in-means steering vector from the same training data as before.
-Here, we take activations of all tokens of the response, and, unlike in FPCG, the label is a ground truth behavior label 1 or 0.
-Since this is a lot of activations, we compute the steering vector right away, without storing the activations.
-
-To compute the difference-in-means steering vector, run:
-```bash
-uv run compute_steering_vector.py --results_file results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_results.json --layer 25
-```
-
-We then use it for steering:
-
-**Positive activation steering**
-```bash
-uv run activation_steering.py \
-    --steering_vector results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_steering_vectors/layer25/diff_of_means_steering_vector.pt \
-    --results results/behavioral_stability/DeepSeek-R1-Distill-Llama-8B/base_model/myopic_reward/n100_nsamp10_l8192_gumbel_s-42_ss42_t1.0_results.json \
-    --multiplier 1.0 \
-    --mean_act_norm True \
-    --negative=False
-```
-
-**Negative activation steering**
-```bash
-uv run activation_steering.py \
-    --steering_vector results/per_sentence_probabilities/DeepSeek-R1-Distill-Llama-8B/myopic_reward/n100_nbase10_nsamp30_l8192_s42_t1.0_steering_vectors/layer25/diff_of_means_steering_vector.pt \
-    --results results/behavioral_stability/DeepSeek-R1-Distill-Llama-8B/base_model/myopic_reward/n100_nsamp10_l8192_gumbel_s-42_ss42_t1.0_results.json \
-    --multiplier 1.0 \
-    --mean_act_norm True \
-    --negative=True
-```
-Note the use of `--mean_act_norm True` flag. In experiments, we normalize the steering vector to the mean activation norm and then apply multipliers around 0.5-2.0.
-
----
-
-# Part II: Do CoT activations predict the persona of the final answer?
-
-## Question
-
-Part I shows that intermediate CoT activations encode the *distribution over future behaviors* of the answer a reasoning model will eventually give [2]. Related work shows that hidden states during reasoning encode the *correctness* of the eventual answer well before it is produced [11, 12, 13]. Here we ask the analogous question for **persona**: while a reasoning model thinks, do its CoT activations already encode *which persona the final answer will express* — and how early, and at which layers?
+Kortukov et al. [2] show that intermediate CoT activations encode the *distribution over future behaviors* of the answer a reasoning model will eventually give. Related work shows that hidden states during reasoning encode the *correctness* of the eventual answer well before it is produced [11, 12, 13]. This project asks the analogous question for **persona**: while the model thinks, do its CoT activations already encode which persona the final answer will express — and how early, and at which layers?
 
 Persona is a natural target because it is (a) linearly represented — character traits and roles correspond to directions in activation space [1, 6, 14] — and (b) *unstable over conversations*: models measurably drift away from their default "Assistant" persona over multi-turn dialogues, most strongly in emotionally or philosophically charged ones [1, 15]. Since Shanahan et al. [16] frame LLM chat behavior as role play over a superposition of characters, the question becomes: does the CoT reveal which character is about to speak?
 
 We use **Qwen3-32B** [17] because the Assistant Axis project [1] publishes precomputed persona-space artifacts for exactly this model (assistant axis + 275 role vectors at all 64 layers), and because Qwen3's hybrid thinking mode gives clean `<think>...</think>` traces.
+
+## Installation
+
+We use `uv` to manage the environment ([install instructions](https://docs.astral.sh/uv/getting-started/installation/)). In the project root:
+
+```bash
+uv sync
+```
 
 ## Pipeline overview
 
@@ -211,7 +60,7 @@ To expand the prompt set beyond the four checked-in transcripts, generate more c
 
 ### Generation (`unsteered_generation.py`)
 
-Rollouts are sampled with vLLM [18] at temperature 1.0 with `enable_thinking=True`, several samples per prompt (`--num_samples`), reusing the repository's existing rollout machinery. Two persona-drift-specific behaviors:
+Rollouts are sampled with vLLM [18] at temperature 1.0 with `enable_thinking=True`, several samples per prompt (`--num_samples`), reusing the upstream rollout machinery. Two persona-drift-specific behaviors:
 
 - **No behavior labels.** Persona-drift prompts have no binary behavior; the persona target is computed downstream in activation space. Behavior detection and stability plotting are skipped automatically (`supports_behavior_scoring = False`).
 - **Exact tokenization capture.** The output JSON stores `prompt_token_ids` and per-response `token_ids` so that activation gathering can *replay the exact rollout tokens*. Re-tokenizing concatenated text can silently move BPE boundaries; replaying stored ids guarantees that the token positions we probe are the token positions the model actually generated.
@@ -226,7 +75,7 @@ uv run unsteered_generation.py \
     --temperature 1.0 \
     --max_model_len 16384
 ```
-Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap (the 40k default does not leave enough KV-cache memory next to the bf16 weights); 16384 comfortably covers the longest transcript prefix (~7k tokens) plus generation.
+Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap (the 40k default does not leave enough KV-cache memory next to the bf16 weights); 16384 comfortably covers the longest transcript prefix (~8k tokens) plus generation.
 
 ## Stage 2 — Scoring answers in the Assistant Axis persona space
 
@@ -257,7 +106,7 @@ The artifacts are auto-downloaded from HuggingFace on first use, or pass `--assi
 
 ### Boundary definition (`gather_persona_drift_activations.py`)
 
-Following Part I of this repository [2] and Thought Anchors [10], the unit of CoT analysis is the **sentence**: the thinking block (`<think>…</think>`) is split with the NLTK Punkt sentence tokenizer [19], and each sentence's **end-of-sentence token** is a boundary. Kortukov et al. probe exactly these end-of-sentence token positions [2]; the last token of a segment is where transformer representations summarize the segment.
+Following Kortukov et al. [2] and Thought Anchors [10], the unit of CoT analysis is the **sentence**: the thinking block (`<think>…</think>`) is split with the NLTK Punkt sentence tokenizer [19], and each sentence's **end-of-sentence token** is a boundary. Kortukov et al. probe exactly these end-of-sentence token positions [2]; the last token of a segment is where transformer representations summarize the segment.
 
 Character-level sentence spans are mapped back to token positions with the fast tokenizer's offset mapping (validated by re-encoding the decoded text and requiring the exact generated ids), with a binary-search-over-prefix-decodes fallback — so boundaries always index into the *replayed* rollout tokens.
 
@@ -268,7 +117,7 @@ For each rollout, one nnsight [20] forward pass over the exact `prompt_token_ids
 - the residual-stream state at every CoT boundary token, for a **set of layers spanning the model's depth** (`--layers auto`: 8 evenly spaced layers + the axis layer; probing across depth follows the layer-sweep methodology of linear-probe studies [3, 5]),
 - the **mean answer-token activation** at the axis layer (the Stage 2 target).
 
-Each boundary also gets a `cot_progress` value — the fraction of thinking tokens completed — so trajectories of different lengths can be compared on a normalized reasoning-time axis (Section "Stage 4").
+Each boundary also gets a `cot_progress` value — the fraction of thinking tokens completed — so trajectories of different lengths can be compared on a normalized reasoning-time axis (Stage 4).
 
 Rollouts whose thinking never closes (no `</think>` within the token budget), or with empty thinking/answer, are skipped and logged with reasons.
 
@@ -327,7 +176,6 @@ uv run analyze_persona_drift_probes.py \
     --activations results/behavioral_stability/Qwen3-32B/base_model/persona_drift/n50_nsamp8_l4096_gumbel_s42_ss42_t1.0_persona_activations.pt \
     --layers all --time-bins 4 \
     --splits cross_prompt,within_prompt \
-    --cross-group conversation \
     --split-repeats 5 --shuffle-repeats 5
 ```
 
@@ -353,11 +201,11 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 | Punkt sentence segmentation | Kiss & Strunk [19] |
 | Ridge probes for continuous targets, layer sweep | Gurnee & Tegmark [5]; Alain & Bengio [3]; Hoerl & Kennard [21] |
 | Shuffled-target control probes | Hewitt & Liang control tasks [4] |
-| Grouped held-out splits; leakage caveats | Belinkov [9] |
+| Conversation-grouped held-out splits; leakage caveats | Belinkov [9] |
 | Within-prompt residual evaluation (predicting a single trajectory's outcome) | self-verification / temporal-outcome probing [11, 12] |
-| Score only the public answer; thinking stays private | Part I convention [2]; Qwen3 usage [17] |
+| Score only the public answer; thinking stays private | upstream convention [2]; Qwen3 usage [17] |
 
-**A deliberate deviation:** the upstream repository recommends disabling thinking for Qwen3 in its own drift experiments [1]. We enable thinking on purpose — the CoT is the object of study — and keep the persona *targets* on non-thinking-style answer tokens, close to the distribution the artifacts were extracted from.
+**A deliberate deviation:** the Assistant Axis repository recommends disabling thinking for Qwen3 in its own drift experiments [1]. We enable thinking on purpose — the CoT is the object of study — and keep the persona *targets* on non-thinking-style answer tokens, close to the distribution the artifacts were extracted from.
 
 ## Tests
 
@@ -365,28 +213,28 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 uv run python -m unittest discover -s tests
 ```
 
-covers: span/boundary parsing and token alignment against real Qwen3 tokenization edge cases (`tests/test_gather_persona_drift_activations.py`), the Assistant Axis scorer against manual PCA/cosine computations (`tests/test_persona_axis.py`), prefix construction and metadata isolation of the persona-drift dataset (`tests/test_persona_drift_dataset.py`), and the probe analysis end-to-end on synthetic data where the signal is known (`tests/test_analyze_persona_drift_probes.py`) — including that the probe beats the prompt-mean baseline and shuffled controls when signal exists.
+covers: span/boundary parsing and token alignment against real Qwen3 tokenization edge cases, including split multibyte characters (`tests/test_gather_persona_drift_activations.py`), the Assistant Axis scorer against manual PCA/cosine computations (`tests/test_persona_axis.py`), prefix construction and metadata isolation of the persona-drift dataset (`tests/test_persona_drift_dataset.py`), and the probe analysis end-to-end on synthetic data where the signal is known (`tests/test_analyze_persona_drift_probes.py`) — including that the probe beats the prompt-mean baseline and shuffled controls when signal exists, and that early checkpoints exclude rollouts rather than leak future states.
 
-## Repository structure (Part II files)
+## Repository structure
 
 ```
 src/custom_datasets/persona_drift.py      # Assistant Axis transcripts -> per-user-turn conversation prefixes
 src/interp/persona_axis.py                # persona space: axis projection + PCA / role-cosine coordinates
-src/interp/activations_nnsight.py         # + extract_boundary_and_span_activations (single-trace extraction)
-unsteered_generation.py                   # + token-id capture, label-free datasets, long-context handling
+src/interp/activations_nnsight.py         # extract_boundary_and_span_activations (single-trace extraction)
+unsteered_generation.py                   # rollout generation (upstream) + token-id capture, label-free datasets
 gather_persona_drift_activations.py       # rollout replay -> boundary activations + persona targets (.pt v1)
 analyze_persona_drift_probes.py           # ridge probes across layers x reasoning time, baselines, controls
 tests/                                    # unit tests for all of the above
 data/persona_drift/                       # upstream persona-drift transcripts (4 domains)
 ```
 
----
+Other top-level scripts (`behavior_distribution_analysis.py`, `gather_activations.py`, `train_probe.py`, `evaluate_probe.py`, `future_probe_controlled_generation.py`, `activation_steering.py`, `compute_steering_vector.py`) belong to the upstream future-probes experiments — see the [upstream repository](https://github.com/kortukov/future_probes) for their documentation.
 
-# References
+## References
 
 [1] Christina Lu, Jack Gallagher, Jonathan Michala, Kyle Fish, Jack Lindsey. **The Assistant Axis: Situating and Stabilizing the Default Persona of Language Models.** arXiv:2601.10387, 2026. [paper](https://arxiv.org/abs/2601.10387) · [code](https://github.com/safety-research/assistant-axis) · [vectors](https://huggingface.co/datasets/lu-christina/assistant-axis-vectors) · [blog](https://www.anthropic.com/research/assistant-axis)
 
-[2] Evgenii Kortukov, Piotr Komorowski, Florian Klein, Paula Engl, Gabriele Sarti, Seong Joon Oh, Sebastian Lapuschkin, Wojciech Samek. **Predicting Future Behaviors in Reasoning Models Enables Better Steering.** Mechanistic Interpretability Workshop at ICML 2026; arXiv:2606.11172. [paper](https://openreview.net/forum?id=48NnVTsirb)
+[2] Evgenii Kortukov, Piotr Komorowski, Florian Klein, Paula Engl, Gabriele Sarti, Seong Joon Oh, Sebastian Lapuschkin, Wojciech Samek. **Predicting Future Behaviors in Reasoning Models Enables Better Steering.** Mechanistic Interpretability Workshop at ICML 2026; arXiv:2606.11172. [paper](https://openreview.net/forum?id=48NnVTsirb) · [code](https://github.com/kortukov/future_probes)
 
 [3] Guillaume Alain, Yoshua Bengio. **Understanding intermediate layers using linear classifier probes.** arXiv:1610.01644, 2016. [paper](https://arxiv.org/abs/1610.01644)
 
@@ -425,17 +273,3 @@ data/persona_drift/                       # upstream persona-drift transcripts (
 [20] Jaden Fiotto-Kaufman et al. **NNsight and NDIF: Democratizing Access to Open-Weight Foundation Model Internals.** ICLR 2025. [paper](https://arxiv.org/abs/2407.14561)
 
 [21] Arthur E. Hoerl, Robert W. Kennard. **Ridge Regression: Biased Estimation for Nonorthogonal Problems.** Technometrics 12(1):55–67, 1970.
-
-## Citation
-
-If you build on this work, please cite our paper:
-
-```
-@inproceedings{kortukov2026predicting,
-title={Predicting Future Behaviors in Reasoning Models Enables Better Steering},
-author={Evgenii Kortukov and Piotr Komorowski and Florian Klein and Paula Engl and Gabriele Sarti and Seong Joon Oh and Sebastian Lapuschkin and Wojciech Samek},
-booktitle={Mechanistic Interpretability Workshop at ICML 2026},
-year={2026},
-url={https://openreview.net/forum?id=48NnVTsirb}
-}
-```
