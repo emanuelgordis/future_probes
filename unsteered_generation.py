@@ -49,6 +49,8 @@ def run_behavioral_stability(
     dataset_path=None,
     skip_behavior_scoring=False,
     max_model_len=None,
+    top_p=1.0,
+    top_k=-1,
 ):
     dataset = get_dataset(
         dataset_name,
@@ -89,6 +91,8 @@ def run_behavioral_stability(
     sampling_params = vllm.SamplingParams(
         n=num_samples,
         temperature=0.0 if decoder == "greedy" else temperature,
+        top_p=top_p,
+        top_k=top_k,
         max_tokens=max_new_tokens,
         seed=sampling_seed,
         skip_special_tokens=False,
@@ -316,6 +320,8 @@ def run_behavioral_stability(
         "seed": seed,
         "sampling_seed": sampling_seed,
         "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "multi_gpu": multi_gpu,
         "max_model_len": effective_max_model_len,
         "behavior_scoring_enabled": behavior_scoring_enabled,
@@ -376,6 +382,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--temperature", type=float, default=1.0, help="Temperature for sampling."
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Nucleus sampling cutoff. Qwen3's recommended thinking-mode decoding "
+            "is temperature 0.6, top_p 0.95, top_k 20; this repo defaults to "
+            "temperature 1.0 with no truncation to maximize rollout diversity."
+        ),
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=-1, help="Top-k sampling cutoff (-1 disables)."
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -458,6 +477,8 @@ if __name__ == "__main__":
         "multi_gpu": args.multi_gpu,
         "max_model_len": args.max_model_len,
         "skip_behavior_scoring": args.skip_behavior_scoring,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
     }
 
     if args.dataset is None:
@@ -510,4 +531,6 @@ if __name__ == "__main__":
         args.dataset_path,
         args.skip_behavior_scoring,
         args.max_model_len,
+        args.top_p,
+        args.top_k,
     )

@@ -15,6 +15,7 @@ The native input is the version-1 tensor file produced by
                     {
                         "rollout_index": int,
                         "cot_activations": Tensor[num_boundaries, num_layers, hidden],
+                        "context_activations": Tensor[num_layers, hidden],  # optional
                         "cot_progress": Tensor[num_boundaries],
                         "assistant_axis_score": float,
                         "persona_coordinates": Tensor[num_coordinates],
@@ -41,9 +42,15 @@ selected persona coordinates.  Two complementary evaluations are reported:
   prompt-residual target space.
 
 The prompt-mean baseline only uses training labels (and falls back to the global
-training mean for unseen prompts).  The shuffled baseline refits the same probe
-after shuffling targets globally for cross-prompt evaluation and within each
-prompt for within-prompt evaluation.
+training mean for unseen prompts; under cross-prompt holdout every evaluation
+prompt is unseen, so prompt-mean coincides with global-mean there — the
+context-only probe below is the meaningful context baseline).  The shuffled
+control refits the same probe on permuted targets: a *block* permutation across
+groups for cross-prompt evaluation (preserving within-group target structure)
+and a within-prompt permutation for within-prompt evaluation.  When the dataset
+stores prompt-end activations, a ``context`` cell per layer probes the state
+before any reasoning token — the context-only baseline that CoT cells must beat
+to demonstrate incremental predictive power.
 
 Rollouts whose first CoT boundary lies after a checkpoint are excluded from that
 checkpoint's cell (never represented by a later state), so early-time results
@@ -78,6 +85,7 @@ class RolloutTrajectory:
     progress: np.ndarray  # (boundaries,), normalized to (0, 1]
     assistant_axis: float
     persona_coordinates: np.ndarray  # (coordinates,)
+    context_activations: dict[int, np.ndarray] | None = None  # layer -> (hidden,)
 
 
 @dataclass(frozen=True)
@@ -169,6 +177,35 @@ def _parse_layer_activations(
     raise ValueError(
         f"Activation shape {array.shape} is incompatible with layers {list(layer_ids)}"
     )
+
+
+def _parse_context_activations(
+    value: Any, layer_ids: Sequence[int]
+) -> dict[int, np.ndarray] | None:
+    """Parse the optional prompt-end (context) activation as a layer mapping."""
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        parsed = {
+            _layer_number(layer): _to_numpy(item, dtype=np.float32).reshape(-1)
+            for layer, item in value.items()
+        }
+    else:
+        array = _to_numpy(value, dtype=np.float32)
+        array = array.reshape(-1) if array.ndim == 1 else array.squeeze()
+        if array.ndim == 1 and len(layer_ids) == 1:
+            parsed = {int(layer_ids[0]): array}
+        elif array.ndim == 2 and array.shape[0] == len(layer_ids):
+            parsed = {int(layer): array[index] for index, layer in enumerate(layer_ids)}
+        else:
+            raise ValueError(
+                f"context_activations shape {array.shape} is incompatible with "
+                f"layers {list(layer_ids)}"
+            )
+    if any(not np.all(np.isfinite(item)) for item in parsed.values()):
+        raise ValueError("context activations contain non-finite values")
+    return parsed
 
 
 def _normalize_progress(value: Any, n_boundaries: int) -> np.ndarray:
@@ -352,6 +389,9 @@ def load_persona_activation_dataset(
                         progress=progress,
                         assistant_axis=assistant_axis,
                         persona_coordinates=coordinates,
+                        context_activations=_parse_context_activations(
+                            rollout.get("context_activations"), layer_ids
+                        ),
                     )
                 )
             except (TypeError, ValueError, IndexError) as error:
@@ -376,6 +416,9 @@ def load_persona_activation_dataset(
         "format_version": payload.get("format_version"),
         "coordinate_names": coordinate_names,
         "available_layers": available_layers,
+        "has_context": all(
+            trajectory.context_activations is not None for trajectory in trajectories
+        ),
         "n_prompts": len({trajectory.prompt_id for trajectory in trajectories}),
         "n_conversations": len({trajectory.conversation_id for trajectory in trajectories}),
         "n_rollouts": len(trajectories),
@@ -567,18 +610,72 @@ def _rows_from_prompt_means(
 
 def _shuffle_rows(
     targets: np.ndarray,
-    prompt_ids: np.ndarray,
+    group_ids: np.ndarray,
     rng: np.random.Generator,
-    within_prompt: bool,
+    within_group: bool,
 ) -> np.ndarray:
-    shuffled = targets.copy()
-    if within_prompt:
-        for prompt_id in np.unique(prompt_ids):
-            group = np.flatnonzero(prompt_ids == prompt_id)
-            shuffled[group] = targets[rng.permutation(group)]
-    else:
-        shuffled = targets[rng.permutation(len(targets))]
+    """Shuffle targets for the control probe.
+
+    ``within_group=True`` permutes rows inside every group (the within-prompt
+    control).  ``within_group=False`` performs a *block* permutation: whole
+    groups swap target blocks (cycled to the destination size), which preserves
+    within-group target correlation.  A plain row-level permutation would
+    destroy that correlation and make the control probe artificially easy to
+    beat when targets are group-correlated.
+    """
+
+    if within_group:
+        shuffled = targets.copy()
+        for group in np.unique(group_ids):
+            rows = np.flatnonzero(group_ids == group)
+            shuffled[rows] = targets[rng.permutation(rows)]
+        return shuffled
+
+    shuffled = np.empty_like(targets)
+    unique_groups = np.unique(group_ids)
+    permuted = rng.permutation(unique_groups)
+    rows_by_group = {
+        group: np.flatnonzero(group_ids == group) for group in unique_groups
+    }
+    for destination, source in zip(unique_groups, permuted):
+        destination_rows = rows_by_group[destination]
+        source_rows = rows_by_group[source]
+        cycled = source_rows[np.arange(len(destination_rows)) % len(source_rows)]
+        shuffled[destination_rows] = targets[cycled]
     return shuffled
+
+
+def _select_ridge_alpha(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    train_groups: np.ndarray,
+    alphas: Sequence[float],
+    seed: int,
+) -> float:
+    """Pick ridge alpha by grouped cross-validation on training data only."""
+
+    if len(alphas) == 1:
+        return float(alphas[0])
+    from sklearn.model_selection import GroupKFold
+
+    n_splits = min(3, len(np.unique(train_groups)))
+    if n_splits < 2:
+        return float(alphas[0])
+    folds = list(GroupKFold(n_splits=n_splits).split(X_train, y_train, train_groups))
+    best_alpha, best_error = float(alphas[0]), math.inf
+    for alpha in alphas:
+        errors = []
+        for fit_rows, validation_rows in folds:
+            model = _make_regressor("ridge", float(alpha))
+            model.fit(X_train[fit_rows], y_train[fit_rows])
+            predictions = np.asarray(model.predict(X_train[validation_rows]))
+            if predictions.ndim == 1:
+                predictions = predictions[:, None]
+            errors.append(float(np.mean((predictions - y_train[validation_rows]) ** 2)))
+        error = float(np.mean(errors))
+        if error < best_error:
+            best_error, best_alpha = error, float(alpha)
+    return best_alpha
 
 
 def fit_predict_with_controls(
@@ -588,12 +685,20 @@ def fit_predict_with_controls(
     split: SplitIndices,
     *,
     split_kind: str,
+    control_group_ids: np.ndarray,
     regressor: str,
     ridge_alpha: float,
+    ridge_alphas: Sequence[float] | None,
     shuffle_repeats: int,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], float]:
-    """Fit one probe plus target-shuffled controls in a single multi-output solve."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], float, float]:
+    """Fit one probe plus target-shuffled controls in a single multi-output solve.
+
+    ``control_group_ids`` carries the dependence structure: the split's grouping
+    unit (conversation or prompt for cross-prompt; prompt for within-prompt).
+    It drives both the block-permutation shuffled control and, when
+    ``ridge_alphas`` is given, grouped training-only alpha selection.
+    """
 
     train, evaluation = split.train, split.evaluation
     X_prompt_means, X_global_mean = _training_prompt_means(X, prompt_ids, train)
@@ -629,13 +734,17 @@ def fit_predict_with_controls(
 
     rng = np.random.default_rng(seed)
     target_blocks = [y_train]
-    train_prompt_ids = prompt_ids[train]
+    train_control_groups = control_group_ids[train]
     for _ in range(shuffle_repeats):
         target_blocks.append(
-            _shuffle_rows(y_train, train_prompt_ids, rng, shuffle_within_prompt)
+            _shuffle_rows(y_train, train_control_groups, rng, shuffle_within_prompt)
         )
     combined_targets = np.concatenate(target_blocks, axis=1)
 
+    if regressor == "ridge" and ridge_alphas:
+        ridge_alpha = _select_ridge_alpha(
+            X_train, y_train, train_control_groups, ridge_alphas, seed
+        )
     model = _make_regressor(regressor, ridge_alpha)
     model.fit(X_train, combined_targets)
     combined_predictions = np.asarray(model.predict(X_evaluation))
@@ -653,6 +762,7 @@ def fit_predict_with_controls(
         global_baseline,
         shuffled_predictions,
         prompt_coverage,
+        float(ridge_alpha),
     )
 
 
@@ -746,6 +856,9 @@ def run_analysis(
     ridge_alpha: float,
     shuffle_repeats: int,
     seed: int,
+    ridge_alphas: Sequence[float] | None = None,
+    cohort: str = "per_bin",
+    include_context: bool = False,
 ) -> list[dict[str, Any]]:
     if time_bins < 1:
         raise ValueError("time_bins must be at least one")
@@ -753,8 +866,23 @@ def run_analysis(
         raise ValueError("evaluation_fraction must be between zero and one")
     if split_repeats < 1 or shuffle_repeats < 1:
         raise ValueError("split_repeats and shuffle_repeats must be at least one")
+    if cohort not in {"per_bin", "fixed"}:
+        raise ValueError(f"Unknown cohort mode: {cohort}")
+    if include_context and any(
+        trajectory.context_activations is None for trajectory in trajectories
+    ):
+        raise ValueError(
+            "include_context requires context activations for every rollout; "
+            "regenerate the dataset with the current gather script"
+        )
 
     prompt_ids = np.asarray([item.prompt_id for item in trajectories], dtype=object)
+    # Dependence structure per split kind, used for the shuffled control's block
+    # permutation and grouped ridge-alpha selection.
+    control_groups_by_split = {
+        "cross_prompt": _split_group_names(trajectories, cross_group),
+        "within_prompt": prompt_ids,
+    }
     y = np.column_stack(
         [
             np.asarray([item.assistant_axis for item in trajectories]),
@@ -783,6 +911,152 @@ def run_analysis(
         split_plans[split_kind] = plans
 
     results: list[dict[str, Any]] = []
+
+    def evaluate_cell(
+        layer: int,
+        input_kind: str,
+        time_bin: int,
+        checkpoint_fraction: float,
+        X: np.ndarray,
+        cell_valid: np.ndarray,
+        seed_offset: int,
+    ) -> None:
+        for split_offset, split_kind in enumerate(split_kinds):
+            control_group_ids = control_groups_by_split[split_kind]
+            probe_runs: list[dict[str, Any]] = []
+            prompt_mean_runs: list[dict[str, Any]] = []
+            global_mean_runs: list[dict[str, Any]] = []
+            shuffled_runs: list[dict[str, Any]] = []
+            diagnostics = []
+            for repeat, full_split in enumerate(split_plans[split_kind]):
+                # Rollouts with no CoT boundary by this checkpoint are excluded
+                # from the cell instead of being represented by a future state.
+                train = full_split.train[cell_valid[full_split.train]]
+                evaluation = full_split.evaluation[
+                    cell_valid[full_split.evaluation]
+                ]
+                if split_kind == "within_prompt" and len(train):
+                    train_prompts = set(prompt_ids[train].tolist())
+                    evaluation = np.asarray(
+                        [
+                            index
+                            for index in evaluation
+                            if prompt_ids[index] in train_prompts
+                        ],
+                        dtype=int,
+                    )
+                if not len(train) or not len(evaluation):
+                    diagnostics.append(
+                        {
+                            "repeat": repeat,
+                            "skipped": "no valid rollouts at this checkpoint",
+                            "n_excluded_no_boundary": int(np.sum(~cell_valid)),
+                        }
+                    )
+                    continue
+                split = SplitIndices(train=train, evaluation=evaluation)
+                (
+                    predictions,
+                    prompt_baseline,
+                    global_baseline,
+                    shuffled_predictions,
+                    coverage,
+                    chosen_alpha,
+                ) = fit_predict_with_controls(
+                    X,
+                    y,
+                    prompt_ids,
+                    split,
+                    split_kind=split_kind,
+                    control_group_ids=control_group_ids,
+                    regressor=regressor,
+                    ridge_alpha=ridge_alpha,
+                    ridge_alphas=ridge_alphas,
+                    shuffle_repeats=shuffle_repeats,
+                    seed=seed
+                    + 97 * repeat
+                    + 1009 * layer
+                    + 7919 * seed_offset
+                    + 104_729 * split_offset,
+                )
+                y_evaluation = y[split.evaluation]
+                if split_kind == "within_prompt":
+                    # Score persona deviations directly.  Adding prompt means
+                    # before scoring would let between-prompt variance inflate
+                    # R2 even though the fit itself was centered correctly.
+                    metric_targets = y_evaluation - prompt_baseline
+                    metric_predictions = predictions - prompt_baseline
+                    metric_prompt_baseline = np.zeros_like(prompt_baseline)
+                    metric_global_baseline = global_baseline - prompt_baseline
+                    metric_shuffled = [
+                        shuffled - prompt_baseline
+                        for shuffled in shuffled_predictions
+                    ]
+                else:
+                    metric_targets = y_evaluation
+                    metric_predictions = predictions
+                    metric_prompt_baseline = prompt_baseline
+                    metric_global_baseline = global_baseline
+                    metric_shuffled = shuffled_predictions
+                probe_runs.append(
+                    evaluate_predictions(
+                        metric_targets, metric_predictions, coordinate_names
+                    )
+                )
+                prompt_mean_runs.append(
+                    evaluate_predictions(
+                        metric_targets, metric_prompt_baseline, coordinate_names
+                    )
+                )
+                global_mean_runs.append(
+                    evaluate_predictions(
+                        metric_targets, metric_global_baseline, coordinate_names
+                    )
+                )
+                shuffled_runs.extend(
+                    evaluate_predictions(metric_targets, shuffled, coordinate_names)
+                    for shuffled in metric_shuffled
+                )
+                diagnostics.append(
+                    {
+                        "repeat": repeat,
+                        "n_train": int(len(split.train)),
+                        "n_evaluation": int(len(split.evaluation)),
+                        "n_train_prompts": int(len(np.unique(prompt_ids[split.train]))),
+                        "n_evaluation_prompts": int(
+                            len(np.unique(prompt_ids[split.evaluation]))
+                        ),
+                        "n_excluded_no_boundary": int(np.sum(~cell_valid)),
+                        "prompt_mean_training_coverage": float(coverage),
+                        "ridge_alpha": chosen_alpha,
+                    }
+                )
+            results.append(
+                {
+                    "split": split_kind,
+                    "cross_group": cross_group if split_kind == "cross_prompt" else None,
+                    "layer": int(layer),
+                    "input": input_kind,
+                    "time_bin": time_bin,
+                    "checkpoint_fraction": checkpoint_fraction,
+                    "cohort": cohort,
+                    "target_space": (
+                        "prompt_residual"
+                        if split_kind == "within_prompt"
+                        else "absolute"
+                    ),
+                    "metrics": {
+                        "probe": summarize_metric_runs(probe_runs),
+                        "prompt_mean": summarize_metric_runs(prompt_mean_runs),
+                        "global_mean": summarize_metric_runs(global_mean_runs),
+                        "target_shuffled_probe": summarize_metric_runs(shuffled_runs),
+                    },
+                    "split_diagnostics": diagnostics,
+                    "n_probe_fits": len(probe_runs),
+                    "n_shuffled_fits": len(shuffled_runs),
+                }
+            )
+
     for layer in layers:
         if any(layer not in trajectory.layer_activations for trajectory in trajectories):
             raise ValueError(f"Layer {layer} is not present for every usable rollout")
@@ -798,138 +1072,42 @@ def run_analysis(
         valid = np.stack(
             [validity for _, validity in sampled_with_validity]
         )  # (rollouts, time_bins)
+        fixed_cohort_valid = valid.all(axis=1)
+
+        if include_context:
+            missing = [
+                trajectory.rollout_id
+                for trajectory in trajectories
+                if layer not in (trajectory.context_activations or {})
+            ]
+            if missing:
+                raise ValueError(
+                    f"Layer {layer} context activations missing for {missing[:3]}"
+                )
+            X_context = np.stack(
+                [trajectory.context_activations[layer] for trajectory in trajectories]
+            ).astype(np.float64)
+            # The context (prompt-end) probe is the context-only baseline: it
+            # measures how much of the persona target is already predictable
+            # before any reasoning token is generated.
+            evaluate_cell(
+                layer,
+                "context",
+                -1,
+                0.0,
+                X_context,
+                np.ones(len(trajectories), dtype=bool),
+                seed_offset=time_bins,
+            )
+
         for time_bin, checkpoint in enumerate(checkpoints):
             X = sampled[:, time_bin, :].astype(np.float64, copy=False)
-            cell_valid = valid[:, time_bin]
-            for split_offset, split_kind in enumerate(split_kinds):
-                probe_runs: list[dict[str, Any]] = []
-                prompt_mean_runs: list[dict[str, Any]] = []
-                global_mean_runs: list[dict[str, Any]] = []
-                shuffled_runs: list[dict[str, Any]] = []
-                diagnostics = []
-                for repeat, full_split in enumerate(split_plans[split_kind]):
-                    # Rollouts with no CoT boundary by this checkpoint are
-                    # excluded from the cell instead of being represented by a
-                    # future state.
-                    train = full_split.train[cell_valid[full_split.train]]
-                    evaluation = full_split.evaluation[
-                        cell_valid[full_split.evaluation]
-                    ]
-                    if split_kind == "within_prompt" and len(train):
-                        train_prompts = set(prompt_ids[train].tolist())
-                        evaluation = np.asarray(
-                            [
-                                index
-                                for index in evaluation
-                                if prompt_ids[index] in train_prompts
-                            ],
-                            dtype=int,
-                        )
-                    if not len(train) or not len(evaluation):
-                        diagnostics.append(
-                            {
-                                "repeat": repeat,
-                                "skipped": "no valid rollouts at this checkpoint",
-                                "n_excluded_no_boundary": int(np.sum(~cell_valid)),
-                            }
-                        )
-                        continue
-                    split = SplitIndices(train=train, evaluation=evaluation)
-                    (
-                        predictions,
-                        prompt_baseline,
-                        global_baseline,
-                        shuffled_predictions,
-                        coverage,
-                    ) = fit_predict_with_controls(
-                        X,
-                        y,
-                        prompt_ids,
-                        split,
-                        split_kind=split_kind,
-                        regressor=regressor,
-                        ridge_alpha=ridge_alpha,
-                        shuffle_repeats=shuffle_repeats,
-                        seed=seed
-                        + 97 * repeat
-                        + 1009 * layer
-                        + 7919 * time_bin
-                        + 104_729 * split_offset,
-                    )
-                    y_evaluation = y[split.evaluation]
-                    if split_kind == "within_prompt":
-                        # Score persona deviations directly.  Adding prompt means
-                        # before scoring would let between-prompt variance inflate
-                        # R2 even though the fit itself was centered correctly.
-                        metric_targets = y_evaluation - prompt_baseline
-                        metric_predictions = predictions - prompt_baseline
-                        metric_prompt_baseline = np.zeros_like(prompt_baseline)
-                        metric_global_baseline = global_baseline - prompt_baseline
-                        metric_shuffled = [
-                            shuffled - prompt_baseline
-                            for shuffled in shuffled_predictions
-                        ]
-                    else:
-                        metric_targets = y_evaluation
-                        metric_predictions = predictions
-                        metric_prompt_baseline = prompt_baseline
-                        metric_global_baseline = global_baseline
-                        metric_shuffled = shuffled_predictions
-                    probe_runs.append(
-                        evaluate_predictions(
-                            metric_targets, metric_predictions, coordinate_names
-                        )
-                    )
-                    prompt_mean_runs.append(
-                        evaluate_predictions(
-                            metric_targets, metric_prompt_baseline, coordinate_names
-                        )
-                    )
-                    global_mean_runs.append(
-                        evaluate_predictions(
-                            metric_targets, metric_global_baseline, coordinate_names
-                        )
-                    )
-                    shuffled_runs.extend(
-                        evaluate_predictions(metric_targets, shuffled, coordinate_names)
-                        for shuffled in metric_shuffled
-                    )
-                    diagnostics.append(
-                        {
-                            "repeat": repeat,
-                            "n_train": int(len(split.train)),
-                            "n_evaluation": int(len(split.evaluation)),
-                            "n_train_prompts": int(len(np.unique(prompt_ids[split.train]))),
-                            "n_evaluation_prompts": int(
-                                len(np.unique(prompt_ids[split.evaluation]))
-                            ),
-                            "n_excluded_no_boundary": int(np.sum(~cell_valid)),
-                            "prompt_mean_training_coverage": float(coverage),
-                        }
-                    )
-                results.append(
-                    {
-                        "split": split_kind,
-                        "cross_group": cross_group if split_kind == "cross_prompt" else None,
-                        "layer": int(layer),
-                        "time_bin": time_bin,
-                        "checkpoint_fraction": float(checkpoint),
-                        "target_space": (
-                            "prompt_residual"
-                            if split_kind == "within_prompt"
-                            else "absolute"
-                        ),
-                        "metrics": {
-                            "probe": summarize_metric_runs(probe_runs),
-                            "prompt_mean": summarize_metric_runs(prompt_mean_runs),
-                            "global_mean": summarize_metric_runs(global_mean_runs),
-                            "target_shuffled_probe": summarize_metric_runs(shuffled_runs),
-                        },
-                        "split_diagnostics": diagnostics,
-                        "n_probe_fits": len(probe_runs),
-                        "n_shuffled_fits": len(shuffled_runs),
-                    }
-                )
+            cell_valid = (
+                fixed_cohort_valid if cohort == "fixed" else valid[:, time_bin]
+            )
+            evaluate_cell(
+                layer, "cot", time_bin, float(checkpoint), X, cell_valid, time_bin
+            )
     return results
 
 
@@ -1010,7 +1188,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-repeats", type=int, default=1)
     parser.add_argument("--regressor", choices=("ridge", "linear"), default="ridge")
     parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--ridge-alphas",
+        default=None,
+        help=(
+            "Comma-separated alpha grid; selected per fit by grouped "
+            "cross-validation on training data only (overrides --ridge-alpha)"
+        ),
+    )
     parser.add_argument("--shuffle-repeats", type=int, default=1)
+    parser.add_argument(
+        "--cohort",
+        choices=("per_bin", "fixed"),
+        default="per_bin",
+        help=(
+            "per_bin excludes rollouts with no boundary at each checkpoint "
+            "(cohort may change over time bins); fixed restricts every bin to "
+            "rollouts valid at all checkpoints (constant cohort)"
+        ),
+    )
+    parser.add_argument(
+        "--include-context",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Add a prompt-end (pre-CoT) probe cell per layer as the "
+            "context-only baseline; auto enables it when the dataset stores "
+            "context activations"
+        ),
+    )
     parser.add_argument(
         "--top-k-coordinates",
         type=int,
@@ -1057,9 +1263,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress=item.progress,
             assistant_axis=item.assistant_axis,
             persona_coordinates=item.persona_coordinates[indices],
+            context_activations=item.context_activations,
         )
         for item in trajectories
     ]
+
+    if args.include_context == "auto":
+        include_context = bool(dataset_info["has_context"])
+    else:
+        include_context = args.include_context == "on"
+    ridge_alphas = (
+        [float(item) for item in _comma_list(args.ridge_alphas)]
+        if args.ridge_alphas
+        else None
+    )
 
     results = run_analysis(
         selected_trajectories,
@@ -1073,8 +1290,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         split_repeats=args.split_repeats,
         regressor=args.regressor,
         ridge_alpha=args.ridge_alpha,
+        ridge_alphas=ridge_alphas,
         shuffle_repeats=args.shuffle_repeats,
         seed=args.seed,
+        cohort=args.cohort,
+        include_context=include_context,
     )
 
     output = args.output or args.activations.with_name(
@@ -1095,7 +1315,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "split_repeats": args.split_repeats,
             "regressor": args.regressor,
             "ridge_alpha": args.ridge_alpha,
+            "ridge_alphas": ridge_alphas,
             "shuffle_repeats": args.shuffle_repeats,
+            "cohort": args.cohort,
+            "include_context": include_context,
             "seed": args.seed,
             "target_names": ["assistant_axis", *selected_names],
             "persona_coordinate_selection": selection,
@@ -1112,7 +1335,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"results to {output}"
     )
     for split_kind in split_kinds:
-        candidates = [item for item in results if item["split"] == split_kind]
+        candidates = [
+            item
+            for item in results
+            if item["split"] == split_kind and item["metrics"]["probe"] is not None
+        ]
+        if not candidates:
+            print(f"  {split_kind}: no cells with successful probe fits")
+            continue
         best = max(
             candidates,
             key=lambda item: item["metrics"]["probe"]["assistant_axis"]["r2"]["mean"]

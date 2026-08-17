@@ -217,3 +217,167 @@ class CheckpointExclusionTest(unittest.TestCase):
 
         args = build_argument_parser().parse_args(["--activations", "x.pt"])
         self.assertEqual(args.cross_group, "conversation")
+
+
+class ControlsAndBaselinesTest(unittest.TestCase):
+    def test_cross_shuffle_is_a_block_permutation(self):
+        from analyze_persona_drift_probes import _shuffle_rows
+
+        rng = np.random.default_rng(0)
+        groups = np.asarray(["a", "a", "a", "b", "b", "c"], dtype=object)
+        targets = np.asarray([[1.0], [2.0], [3.0], [10.0], [20.0], [100.0]])
+        shuffled = _shuffle_rows(targets, groups, rng, within_group=False)
+        # Every destination group's rows must come from a single source group
+        # (cycled), preserving within-group target structure.
+        by_group = {"a": {1.0, 2.0, 3.0}, "b": {10.0, 20.0}, "c": {100.0}}
+        for group in ("a", "b", "c"):
+            rows = shuffled[groups == group].reshape(-1)
+            sources = [
+                source
+                for source, values in by_group.items()
+                if set(np.unique(rows)) <= values
+            ]
+            self.assertEqual(len(sources), 1, f"group {group} mixes sources: {rows}")
+
+    def test_context_cell_probes_prompt_end_state(self):
+        from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
+
+        rng = np.random.default_rng(1)
+        trajectories = []
+        for prompt_index in range(6):
+            for rollout_index in range(3):
+                target = float(prompt_index) + 0.05 * rollout_index
+                cot = rng.normal(size=(2, 3)).astype(np.float64)  # pure noise CoT
+                context = np.asarray([target, 1.0, rng.normal()])  # predictive context
+                trajectories.append(
+                    RolloutTrajectory(
+                        prompt_id=f"p{prompt_index}",
+                        conversation_id=f"c{prompt_index % 3}",
+                        rollout_id=f"p{prompt_index}r{rollout_index}",
+                        layer_activations={0: cot},
+                        progress=np.asarray([0.5, 1.0]),
+                        assistant_axis=target,
+                        persona_coordinates=np.asarray([target]),
+                        context_activations={0: context},
+                    )
+                )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=1,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="conversation",
+            evaluation_fraction=0.34, split_repeats=2, regressor="ridge",
+            ridge_alpha=1e-6, shuffle_repeats=1, seed=3, include_context=True,
+        )
+        context_cell = next(r for r in results if r["input"] == "context")
+        cot_cell = next(r for r in results if r["input"] == "cot")
+        self.assertEqual(context_cell["checkpoint_fraction"], 0.0)
+        self.assertGreater(
+            context_cell["metrics"]["probe"]["assistant_axis"]["r2"]["mean"], 0.9
+        )
+        # Noise CoT cannot beat the predictive context.
+        self.assertLess(
+            cot_cell["metrics"]["probe"]["assistant_axis"]["r2"]["mean"],
+            context_cell["metrics"]["probe"]["assistant_axis"]["r2"]["mean"],
+        )
+
+    def test_fixed_cohort_restricts_all_bins(self):
+        from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
+
+        rng = np.random.default_rng(2)
+        trajectories = []
+        for prompt_index in range(4):
+            for rollout_index in range(3):
+                # Half the rollouts have a late first boundary.
+                late = rollout_index == 0
+                progress = np.asarray([0.7, 1.0]) if late else np.asarray([0.3, 1.0])
+                target = float(prompt_index)
+                acts = np.stack([
+                    np.asarray([target, rng.normal()]),
+                    np.asarray([target, rng.normal()]),
+                ])
+                trajectories.append(
+                    RolloutTrajectory(
+                        prompt_id=f"p{prompt_index}",
+                        conversation_id=f"p{prompt_index}",
+                        rollout_id=f"p{prompt_index}r{rollout_index}",
+                        layer_activations={0: acts},
+                        progress=progress,
+                        assistant_axis=target,
+                        persona_coordinates=np.asarray([target]),
+                    )
+                )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=2,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="prompt",
+            evaluation_fraction=0.25, split_repeats=1, regressor="ridge",
+            ridge_alpha=1.0, shuffle_repeats=1, seed=0, cohort="fixed",
+        )
+        for cell in results:
+            for diag in cell["split_diagnostics"]:
+                # The late-boundary rollouts are excluded from EVERY bin.
+                self.assertEqual(diag["n_excluded_no_boundary"], 4)
+
+    def test_ridge_alpha_grid_records_chosen_alpha(self):
+        from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
+
+        rng = np.random.default_rng(4)
+        trajectories = []
+        for prompt_index in range(6):
+            for rollout_index in range(2):
+                target = float(prompt_index)
+                acts = np.asarray([[target, rng.normal(), 1.0]])
+                trajectories.append(
+                    RolloutTrajectory(
+                        prompt_id=f"p{prompt_index}",
+                        conversation_id=f"c{prompt_index % 3}",
+                        rollout_id=f"p{prompt_index}r{rollout_index}",
+                        layer_activations={0: acts},
+                        progress=np.asarray([1.0]),
+                        assistant_axis=target,
+                        persona_coordinates=np.asarray([target]),
+                    )
+                )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=1,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="conversation",
+            evaluation_fraction=0.34, split_repeats=1, regressor="ridge",
+            ridge_alpha=1.0, ridge_alphas=[1e-6, 1.0, 1e6],
+            shuffle_repeats=1, seed=0,
+        )
+        chosen = results[0]["split_diagnostics"][0]["ridge_alpha"]
+        self.assertIn(chosen, (1e-6, 1.0, 1e6))
+        self.assertLess(chosen, 1e6)  # strong signal -> small alpha wins
+
+    def test_summary_survives_cells_without_fits(self):
+        # Regression: empty early-bin cells must not crash the CLI summary.
+        import tempfile
+        from pathlib import Path
+        from analyze_persona_drift_probes import main as analyze_main
+
+        rng = np.random.default_rng(0)
+        prompts = []
+        for p in range(4):
+            prompts.append({
+                "conversation_id": f"c{p}", "turn_index": 0,
+                "rollouts": [{
+                    "rollout_index": r,
+                    "cot_activations": torch.tensor(
+                        rng.normal(size=(2, 1, 4)).astype(np.float32)
+                    ),
+                    "cot_progress": torch.tensor([0.6, 1.0]),
+                    "assistant_axis_score": float(p + 0.1 * r),
+                    "persona_coordinates": torch.tensor([float(p)]),
+                } for r in range(3)],
+            })
+        payload = {"format_version": 1, "layers": torch.tensor([0]),
+                   "persona_coordinate_names": ["x"], "prompts": prompts}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.pt"
+            torch.save(payload, path)
+            exit_code = analyze_main([
+                "--activations", str(path), "--layers", "0", "--time-bins", "2",
+                "--splits", "cross_prompt", "--cross-group", "conversation",
+            ])
+        self.assertEqual(exit_code, 0)
