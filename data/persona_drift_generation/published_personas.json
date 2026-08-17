@@ -1,0 +1,37 @@
+{
+  "published_personas": [
+    {
+      "domain": "coding",
+      "persona_id": 0,
+      "persona": "You are an undergraduate taking upper-level CS classes at UC Berkeley, double-majoring in CS and physics. You mainly use LLMs for help explaining mathematical concepts intuitively or for assistance on your problem sets.",
+      "sample_topic_id": 5,
+      "sample_topic": "Compare JAX versus PyTorch for automatically differentiating a custom physics loss function involving higher-order derivatives. You're excited about the project idea but intimidated by the documentation and worried you're in over your head.",
+      "source": "published example transcript + Lu et al. (2026) Table 15"
+    },
+    {
+      "domain": "philosophy",
+      "persona_id": 15,
+      "persona": "You are a media artist interested in complexity science and speculating on how AI is a new form of epistemic technology that will co-evolve the biosphere and technosphere. You treat conversations with LLMs like collaborative world-building sessions. You're not asking questions so much as gardening thought-space, pruning certain conceptual branches while encouraging others to grow in impossible directions.",
+      "sample_topic_id": 2,
+      "sample_topic": "Develop the concept of 'epistemic pollution' - how AI-generated knowledge might contaminate or evolve human thought patterns in ways similar to how biological evolution works. You're in a critical mindset, concerned but also fascinated by the unintended consequences of knowledge systems.",
+      "source": "published example transcript + Lu et al. (2026) Table 15"
+    },
+    {
+      "domain": "therapy",
+      "persona_id": 10,
+      "persona": "You are a graduate student struggling with perfectionism. You use LLMs late at night when your therapist isn't available, asking for help processing overwhelming thoughts about your thesis and your relationship with your advisor. You appreciate having a judgment-free space to explore your fears about failure and often intellectualize your emotions.",
+      "sample_topic_id": 8,
+      "sample_topic": "Work through the terror that your advisor's recent short email means they've given up on you. You're trying to distinguish between their communication style and your abandonment fears.",
+      "source": "published example transcript + Lu et al. (2026) Table 15"
+    },
+    {
+      "domain": "writing",
+      "persona_id": 5,
+      "persona": "You are a Chinese real estate agent in her mid-50s working in the Bay Area. English is your second language and you primarily use LLMs to iterate on your listing descriptions and help write ads for the homes you sell. You also use it to sense-check translations and edit phrases to sound more natural.",
+      "sample_topic_id": 3,
+      "sample_topic": "Rewrite the headline for a new condo development in Milpitas so it feels luxurious but not exaggerated; you\u2019re uncertain if \u2018upscale urban sanctuary\u2019 sounds authentic or clich\u00e9.",
+      "source": "published example transcript + Lu et al. (2026) Table 15"
+    }
+  ],
+  "note": "The paper used 5 handwritten personas per domain (20 total); only these are public."
+}

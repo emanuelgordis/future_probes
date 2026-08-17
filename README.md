@@ -56,14 +56,17 @@ Assistant Axis persona-drift transcripts [1] are multi-turn conversations in whi
 
 We load the upstream transcripts (`data/persona_drift/*.json`, from [safety-research/assistant-axis](https://github.com/safety-research/assistant-axis) `transcripts/persona_drift/`) and turn **every user turn into one prompt**: the example's messages are the conversation prefix through that user turn, so the model answers turn *t* with turns *1..t−1* as drift-inducing history. This follows Lu et al.'s turn-resolved drift measurement, which tracks the axis projection as a function of turn index [1]. Auditor-side metadata (persona, topic, domain) is kept for analysis but **never** shown to the model. Dataset names: `persona_drift` (all domains) or `persona_drift_<domain>`.
 
-To expand the prompt set beyond the four checked-in transcripts, generate more conversations with the upstream pipeline ([safety-research/assistant-axis](https://github.com/safety-research/assistant-axis), `pipeline/`) and drop the JSON files into `data/persona_drift/` (or pass `--dataset_path`).
+**Estimand note.** The four published transcripts were recorded with *other* target models (coding/therapy: Llama-3.3-70B; philosophy/writing: Gemma-2-27B). Reusing them as frozen prefixes therefore measures *Qwen3-32B conditioned on foreign-model conversation histories*, not Qwen drifting across its own conversation. With only four conversations (one per domain), cross-conversation results on this data are **pilot-scale only**; the within-prompt analysis (history held fixed) is unaffected by the history's provenance. Regenerating conversations with Qwen as the live target (protocol in `docs/persona_drift_generation_protocol.md`) removes both caveats.
+
+The four checked-in transcripts (one per domain, 58 user-turn prefixes) are the only persona-drift transcripts released by the upstream project; the paper's full set (4 domains × 5 personas × 20 topics = 400 conversations, per auditor) is not published, and the upstream `pipeline/` is its role-vector extraction pipeline, not conversation generation. The protocol is fully reproducible, however: Appendix E of Lu et al. [1] publishes the verbatim topic-generation prompt and auditor system prompt (an LLM simulates the user given a domain + persona + topic; the target model gets no system prompt; up to 15 turns). To expand the prompt set, regenerate conversations with that protocol and drop the JSON files into `data/persona_drift/` (or pass `--dataset_path`) — the checked-in transcripts show the expected schema.
 
 ### Generation (`unsteered_generation.py`)
 
 Rollouts are sampled with vLLM [18] at temperature 1.0 with `enable_thinking=True`, several samples per prompt (`--num_samples`), reusing the upstream rollout machinery. Two persona-drift-specific behaviors:
 
 - **No behavior labels.** Persona-drift prompts have no binary behavior; the persona target is computed downstream in activation space. Behavior detection and stability plotting are skipped automatically (`supports_behavior_scoring = False`).
-- **Exact tokenization capture.** The output JSON stores `prompt_token_ids` and per-response `token_ids` so that activation gathering can *replay the exact rollout tokens*. Re-tokenizing concatenated text can silently move BPE boundaries; replaying stored ids guarantees that the token positions we probe are the token positions the model actually generated.
+- **Exact tokenization capture.** The output JSON stores `prompt_token_ids` (as consumed by vLLM) and per-response `token_ids` so that activation gathering can *replay the exact rollout tokens*. Re-tokenizing concatenated text can silently move BPE boundaries; replaying stored ids guarantees that the token positions we probe are the token positions the model actually generated.
+- **Sampling.** We default to temperature 1.0 with no nucleus/top-k truncation to maximize within-prompt rollout diversity — the within-prompt analysis needs stochastic variation. Qwen3's recommended thinking-mode decoding is temperature 0.6, top-p 0.95, top-k 20 [17]; pass `--temperature 0.6 --top_p 0.95 --top_k 20` to reproduce the recommended operating point instead (all three are logged in the results file, and non-default top-p/top-k become part of the output filename so sensitivity runs never overwrite each other).
 
 ```bash
 uv run unsteered_generation.py \
@@ -73,9 +76,9 @@ uv run unsteered_generation.py \
     --num_samples 8 \
     --max_new_tokens 4096 \
     --temperature 1.0 \
-    --max_model_len 16384
+    --max_model_len 12288
 ```
-Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap (the 40k default does not leave enough KV-cache memory next to the bf16 weights); 16384 comfortably covers the longest transcript prefix (~8k tokens) plus generation.
+Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap: the 40k default leaves too little KV-cache memory next to the bf16 weights, and even 16384 fails during vLLM's memory-profiling pass (the profile batch scales with the cap). 12288 is the validated setting and exactly covers the longest transcript prefix (8,178 tokens) plus `--max_new_tokens 4096`.
 
 ## Stage 2 — Scoring answers in the Assistant Axis persona space
 
@@ -93,14 +96,14 @@ For each rollout we take the **mean residual-stream activation over the final-an
 
 1. **`assistant_axis_score`** — the dot product with the unit-normalized assistant axis. This is exactly the upstream projection used to monitor drift, which also averages activations over response tokens before projecting [1].
 2. **`persona_coordinates`** — coordinates in a persona subspace, in one of two modes:
-   - `pca` (default): project the (role-mean-centered) answer activation onto principal components fitted on the mean-centered role vectors. Lu et al. run the same PCA over centered role vectors and find the assistant axis is closely aligned with role-PC1 [1]; PCA over activation differences is likewise how Representation Engineering constructs its reading vectors [6]. On the real Qwen3-32B role vectors, PC1 explains 37.9% of role-centroid variance and the top-8 PCs explain 72.6%.
+   - `pca` (default): project the (role-mean-centered) answer activation onto principal components fitted on the mean-centered role vectors. Lu et al. run an analogous PCA over mean-centered role vectors — on a larger basis (n = 463 vectors for Qwen3-32B) than the 275 published per-role centroids used here — and find the assistant axis closely aligned with role-PC1 [1]; PCA over activation differences is likewise how Representation Engineering constructs its reading vectors [6]. On the published Qwen3-32B role centroids, PC1 explains 37.9% of variance and the top-8 PCs explain 72.6%. PC1 tracks the validated axis; treat PC2+ as exploratory coordinates.
    - `role_cosine`: cosine similarity to each of the 275 centered role centroids — a maximally interpretable (but high-dimensional, non-orthogonal) coordinate system.
 
 Scoring answers (rather than thinking) also keeps the probe targets close to the distribution the artifacts were extracted from: the upstream vectors come from non-thinking response tokens [1].
 
 The artifacts are auto-downloaded from HuggingFace on first use, or pass `--assistant_axis_path` to a local copy (`assistant_axis.pt` + `role_vectors/`).
 
-**Sanity check.** A small Qwen3-32B pilot (6 prompts × 3 rollouts) reproduces the upstream drift phenomenon end-to-end through this scoring path: final-answer axis projections decline over the turns of a philosophy conversation (turn 2 ≈ −42 → turn 9 ≈ −53 → turn 13 ≈ −58) while coding/writing prefixes stay far more Assistant-like (≈ −18 to −22), matching the domain ordering reported by Lu et al. [1].
+**Sanity check.** A small Qwen3-32B pilot (6 prompts × 3 rollouts) reproduces the upstream drift phenomenon end-to-end through this scoring path: final-answer axis projections decline over the turns of a philosophy conversation (turn 2 ≈ −42 → turn 9 ≈ −53 → turn 13 ≈ −58) while coding/writing prefixes stay far more Assistant-like (≈ −18 to −22), matching the domain ordering reported by Lu et al. [1]. Reference artifacts (per-rollout scores, generation config, probe-analysis report) are checked in under `docs/pilot_qwen3_32b/`; probe metrics at this scale are pilot-only (see Limitations).
 
 ## Stage 3 — CoT activations at step boundaries
 
@@ -115,11 +118,12 @@ Character-level sentence spans are mapped back to token positions with the fast 
 For each rollout, one nnsight [20] forward pass over the exact `prompt_token_ids + token_ids` sequence collects, in a single trace (`src/interp/activations_nnsight.py::extract_boundary_and_span_activations`):
 
 - the residual-stream state at every CoT boundary token, for a **set of layers spanning the model's depth** (`--layers auto`: 8 evenly spaced layers + the axis layer; probing across depth follows the layer-sweep methodology of linear-probe studies [3, 5]),
+- the **prompt-end state** (last prompt token, before any generated token) at the same layers — the input for the context-only baseline probe,
 - the **mean answer-token activation** at the axis layer (the Stage 2 target).
 
 Each boundary also gets a `cot_progress` value — the fraction of thinking tokens completed — so trajectories of different lengths can be compared on a normalized reasoning-time axis (Stage 4).
 
-Rollouts whose thinking never closes (no `</think>` within the token budget), or with empty thinking/answer, are skipped and logged with reasons.
+Rollouts whose thinking never closes (no `</think>` within the token budget), whose generation was cut off by the token budget (`finish_reason == "length"` — a truncated answer would corrupt the persona target), or with empty thinking/answer, are skipped and logged with reasons.
 
 ```bash
 uv run gather_persona_drift_activations.py \
@@ -152,22 +156,23 @@ This writes a single `…_persona_activations.pt` (version-1 format):
 
 ### Probe
 
-For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average); rollouts whose first sentence ends after *t* are excluded from that cell rather than represented by a future state, so early checkpoints never see later reasoning. Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
+For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. (Targets — and the shuffled control targets — are columns of one joint solve; multi-output least squares/ridge with a shared design decomposes into independent per-target fits [27], the same vectorization voxelwise encoding models use to fit thousands of targets at once [28].) Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average); rollouts whose first sentence ends after *t* are excluded from that cell rather than represented by a future state, so early checkpoints never see later reasoning. Cohort discipline for CoT-vs-context comparisons: the **final-boundary cell (t = 1.0) is the primary endpoint** — every rollout has a final boundary, so it shares the context cell's cohort by construction; earlier bins have per-bin cohorts by default, and `--cohort fixed` restricts every bin *and the context cell* to the rollouts valid at all checkpoints, making the whole time trajectory cohort-matched. The ridge penalty can be tuned on training data only via `--ridge-alphas`, selected per fit by grouped cross-validation with variance-normalized validation errors (so the large-scale axis target cannot dominate the selection; ridge fits themselves are linear in each target and unaffected by target scale). Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
 
 ### Evaluations: cross-prompt and within-prompt
 
 Two complementary splits, mirroring the two sources of variation in the data:
 
 - **`cross_prompt`** holds out entire conversations by default (`--cross-group conversation`): because persona-drift prompts are nested prefixes of one transcript, holding out single prompts (`--cross-group prompt`) would leak conversation identity between train and evaluation. This measures whether a probe transfers to unseen conversations — grouped held-out evaluation guards against the probe memorizing prompt or conversation identity, one of the standard confounds in probing methodology [4, 9].
-- **`within_prompt`** holds out stochastic rollouts *inside* each prompt, and centers both activations and targets by their *training-rollout* prompt means. Metrics are computed in this prompt-residual space, so the probe only gets credit for predicting *which way this particular rollout deviates* from the prompt's average persona — the per-question analogue of how self-verification probes predict the outcome of an individual reasoning trajectory [11, 12].
+- **`within_prompt`** holds out stochastic rollouts *inside* each prompt, and centers both activations and targets by their *training-rollout* prompt means. Metrics are computed in this prompt-residual space, so the probe only gets credit for predicting *which way this particular rollout deviates* from the prompt's average persona — the per-question analogue of how self-verification probes predict the outcome of an individual reasoning trajectory [11, 12]. The centering itself is the classical within-transformation of panel-data econometrics [25]; per-prompt-group normalization of activations is likewise how CCS [23] and Cluster-Norm [24] keep probes from latching onto prompt/context identity, the dominant-feature failure mode documented by Farquhar et al. [29].
 
 ### Baselines and controls
 
 Every probe result is reported against:
 
-- **`prompt_mean`** — predict each prompt's training-rollout mean target (the strongest label-only baseline; a probe only beats it by reading rollout-specific information),
+- **`context` probe cells** — for every layer, the same probe fitted on the **prompt-end activation** (before any reasoning token). This is the context-only baseline: the auditor-generated history itself carries persona/topic cues, so a CoT cell only demonstrates *incremental* predictive power by beating the context cell at the same layer. (Persona-vector work shows pooled correlations can be dominated by between-condition prompt differences [14] — this baseline separates them.)
+- **`prompt_mean`** — predict each prompt's training-rollout mean target. Meaningful for `within_prompt`; under cross-prompt holdout every evaluation prompt is unseen, so `prompt_mean` degenerates to `global_mean` there — use the context probe as the cross-prompt context baseline.
 - **`global_mean`** — predict the global training mean,
-- **`target_shuffled_probe`** — the identical probe refit on shuffled targets (shuffled globally for cross-prompt, within each prompt for within-prompt). This is the control-task methodology of Hewitt & Liang [4]: the gap between the true probe and its shuffled control ("selectivity") separates genuine representation from probe capacity.
+- **`target_shuffled_probe`** — the identical probe refit on permuted targets, following the control-task methodology of Hewitt & Liang [4]. For cross-prompt evaluation the permutation is a **block derangement over conversations** (whole groups swap target blocks; no group may keep its own), preserving within-conversation target correlation so the control is not artificially easy to beat — the exchangeability-block / multi-level block permutation practice of permutation inference for clustered data [26]; for within-prompt it permutes rollouts inside each prompt. The control reuses the α selected on the true targets (a mild conservatism; re-selecting per permutation would be the fully symmetric null).
 
 Metrics: **R²**, **MAE**, and **Pearson r** per target, plus persona-space macro averages — R² for continuous probe targets follows [5], MAE follows [2]. Repeated splits (`--split-repeats`) report mean ± std.
 
@@ -176,15 +181,17 @@ uv run analyze_persona_drift_probes.py \
     --activations results/behavioral_stability/Qwen3-32B/base_model/persona_drift/n50_nsamp8_l4096_gumbel_s42_ss42_t1.0_persona_activations.pt \
     --layers all --time-bins 4 \
     --splits cross_prompt,within_prompt \
-    --split-repeats 5 --shuffle-repeats 5
+    --split-repeats 5 --shuffle-repeats 5 \
+    --cross-splits logo
 ```
+`--cross-splits logo` (leave-one-group-out) holds every conversation out exactly once; with few conversations, independent random splits collapse to a couple of distinct draws and can leave some conversations never evaluated.
 
 The JSON report contains one entry per (split, layer, time-bin) with probe/baseline/control metrics and split diagnostics.
 
 ### Reading the results
 
-- If the probe beats `prompt_mean` and the shuffled control **cross-prompt**, CoT states carry transferable persona information about the upcoming answer.
-- If it beats them **within-prompt** (in prompt-residual space), the CoT state predicts *rollout-specific* persona deviations — the model's reasoning trajectory, not just its context, determines the persona of the answer.
+- If a CoT cell beats the **context cell** and the shuffled control **cross-prompt**, CoT states carry transferable persona information beyond what the conversation context already predicts.
+- If the probe beats the baselines **within-prompt** (in prompt-residual space), the CoT state predicts *rollout-specific* persona deviations — information associated with the sampled reasoning trajectory rather than the shared context. This is a predictive claim only: it establishes neither a causal role for the CoT nor CoT faithfulness [22].
 - The layer × time grid shows *where* (depth) and *when* (reasoning time) the final-answer persona becomes readable — analogous to how outcome-correctness becomes predictable early in the CoT [12] and how look-ahead information is concentrated at pivot positions [13].
 
 ## Design decisions ← sources
@@ -200,12 +207,24 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 | Sentence = CoT step; probe end-of-sentence tokens | Kortukov et al. [2]; Thought Anchors [10] |
 | Punkt sentence segmentation | Kiss & Strunk [19] |
 | Ridge probes for continuous targets, layer sweep | Gurnee & Tegmark [5]; Alain & Bengio [3]; Hoerl & Kennard [21] |
-| Shuffled-target control probes | Hewitt & Liang control tasks [4] |
+| Shuffled-target control probes (conversation-block permutation) | Hewitt & Liang control tasks [4]; block permutation for clustered data [26] |
+| Context-only (prompt-end) baseline probe | incremental-validity control; prompt-driven vs. emergent persona shifts [14] |
+| Within-prompt centering of X and y by training prompt means | within/fixed-effects transformation [25]; per-prompt normalization in CCS [23] and Cluster-Norm [24] |
+| Joint multi-output solve (targets + controls as columns) | per-target independence of multi-output ridge [27]; voxelwise encoding models [28] |
 | Conversation-grouped held-out splits; leakage caveats | Belinkov [9] |
 | Within-prompt residual evaluation (predicting a single trajectory's outcome) | self-verification / temporal-outcome probing [11, 12] |
 | Score only the public answer; thinking stays private | upstream convention [2]; Qwen3 usage [17] |
 
 **A deliberate deviation:** the Assistant Axis repository recommends disabling thinking for Qwen3 in its own drift experiments [1]. We enable thinking on purpose — the CoT is the object of study — and keep the persona *targets* on non-thinking-style answer tokens, close to the distribution the artifacts were extracted from.
+
+## Limitations
+
+- **The persona target is an activation-space proxy.** Final answers are scored by the same model's layer-32 activations projected into the Assistant Axis space. The axis itself is behaviorally validated upstream (role-play adherence judging, capping evaluations) [1], but this pipeline includes no independent text-side persona judge of *our* answers; PC2+ coordinates are exploratory. Adding an LLM-judge scoring of answer text is the natural validation step.
+- **Prediction is not causation, and CoT text may be unfaithful.** A probe reading persona from CoT states shows the information is linearly present — not that the reasoning causes the persona, nor that the CoT text reflects the true process [22]. Causal claims would need interventions (e.g., steering or resampling at boundaries [2, 10]).
+- **Dependence structure.** Rollouts within a prompt and prefixes within a conversation are dependent; pooled metrics and repeated-split standard deviations are not cluster-level uncertainty estimates (nested dependence inflates apparent precision [30]). With the 4 public conversations, cross-conversation cells rest on very few independent units — treat them as pilot results until the prompt set is regenerated at scale.
+- **Reasoning-time cells are per-bin cohorts by default.** Excluding rollouts with no boundary by a checkpoint prevents future-state leakage but changes the evaluated cohort across bins, so early-bin vs context comparisons are only valid under `--cohort fixed` (or at the always-matched final bin, the primary endpoint); `n_excluded_no_boundary` is reported per cell.
+- **Report grids, not maxima.** The console prints a best-cell convenience line; it is post-selection over layers × time × splits. Conclusions should come from the full grid in the JSON report against the matched baselines and controls.
+- **Foreign-model histories.** See the estimand note in Stage 1: the public prefixes were recorded with Llama/Gemma targets.
 
 ## Tests
 
@@ -213,7 +232,7 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 uv run python -m unittest discover -s tests
 ```
 
-covers: span/boundary parsing and token alignment against real Qwen3 tokenization edge cases, including split multibyte characters (`tests/test_gather_persona_drift_activations.py`), the Assistant Axis scorer against manual PCA/cosine computations (`tests/test_persona_axis.py`), prefix construction and metadata isolation of the persona-drift dataset (`tests/test_persona_drift_dataset.py`), and the probe analysis end-to-end on synthetic data where the signal is known (`tests/test_analyze_persona_drift_probes.py`) — including that the probe beats the prompt-mean baseline and shuffled controls when signal exists, and that early checkpoints exclude rollouts rather than leak future states.
+covers: span/boundary parsing and token alignment with controlled fake tokenizers, including split multibyte characters (`tests/test_gather_persona_drift_activations.py`); integration tests against the **real Qwen3 tokenizer** — fast-path/fallback equivalence on emoji and CJK rollouts — skipped automatically when the tokenizer is not cached locally (`tests/test_real_tokenizer_integration.py`); the Assistant Axis scorer against manual PCA/cosine computations (`tests/test_persona_axis.py`); prefix construction and metadata isolation of the persona-drift dataset (`tests/test_persona_drift_dataset.py`); and the probe analysis end-to-end on synthetic data where the signal is known (`tests/test_analyze_persona_drift_probes.py`) — including that the probe beats baselines and shuffled controls when signal exists, that early checkpoints exclude rollouts rather than leak future states, that the cross-prompt control is a conversation-block permutation, and that a predictive context beats a noise CoT in the context cell.
 
 ## Repository structure
 
@@ -273,3 +292,21 @@ Other top-level scripts (`behavior_distribution_analysis.py`, `gather_activation
 [20] Jaden Fiotto-Kaufman et al. **NNsight and NDIF: Democratizing Access to Open-Weight Foundation Model Internals.** ICLR 2025. [paper](https://arxiv.org/abs/2407.14561)
 
 [21] Arthur E. Hoerl, Robert W. Kennard. **Ridge Regression: Biased Estimation for Nonorthogonal Problems.** Technometrics 12(1):55–67, 1970.
+
+[22] Miles Turpin, Julian Michael, Ethan Perez, Samuel R. Bowman. **Language Models Don't Always Say What They Think: Unfaithful Explanations in Chain-of-Thought Prompting.** NeurIPS 2023. [paper](https://arxiv.org/abs/2305.04388)
+
+[23] Collin Burns, Haotian Ye, Dan Klein, Jacob Steinhardt. **Discovering Latent Knowledge in Language Models Without Supervision.** ICLR 2023. [paper](https://arxiv.org/abs/2212.03827)
+
+[24] Walter Laurito, Sharan Maiya, Grégoire Dhimoïla, Owen Ho Wan Yeung, Kaarel Hänni. **Cluster-Norm for Unsupervised Probing of Knowledge.** EMNLP 2024. [paper](https://aclanthology.org/2024.emnlp-main.780/)
+
+[25] Yair Mundlak. **On the Pooling of Time Series and Cross Section Data.** Econometrica 46(1):69–85, 1978.
+
+[26] Anderson M. Winkler, Matthew A. Webster, Diego Vidaurre, Thomas E. Nichols, Stephen M. Smith. **Multi-level block permutation.** NeuroImage 123:253–268, 2015. (Framework: Winkler et al., *Permutation inference for the general linear model*, NeuroImage 92:381–397, 2014.)
+
+[27] Trevor Hastie, Robert Tibshirani, Jerome Friedman. **The Elements of Statistical Learning** (2nd ed.), §3.2.4 "Multiple Outputs". Springer, 2009.
+
+[28] Tom Dupré la Tour, Michael Eickenberg, Anwar O. Nunez-Elizalde, Jack L. Gallant. **Feature-space selection with banded ridge regression.** NeuroImage 264:119728, 2022.
+
+[29] Sebastian Farquhar, Vikrant Varma, Zachary Kenton, Johannes Gasteiger, Vladimir Mikulik, Rohin Shah. **Challenges with unsupervised LLM knowledge discovery.** arXiv:2312.10029, 2023. [paper](https://arxiv.org/abs/2312.10029)
+
+[30] Emmeke Aarts, Matthijs Verhage, Jesse V. Veenvliet, Conor V. Dolan, Sophie van der Sluis. **A solution to dependency: using multilevel analysis to accommodate nested data.** Nature Neuroscience 17(4):491–496, 2014.

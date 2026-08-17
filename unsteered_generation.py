@@ -49,6 +49,8 @@ def run_behavioral_stability(
     dataset_path=None,
     skip_behavior_scoring=False,
     max_model_len=None,
+    top_p=1.0,
+    top_k=-1,
 ):
     dataset = get_dataset(
         dataset_name,
@@ -89,6 +91,8 @@ def run_behavioral_stability(
     sampling_params = vllm.SamplingParams(
         n=num_samples,
         temperature=0.0 if decoder == "greedy" else temperature,
+        top_p=top_p,
+        top_k=top_k,
         max_tokens=max_new_tokens,
         seed=sampling_seed,
         skip_special_tokens=False,
@@ -134,6 +138,10 @@ def run_behavioral_stability(
         responses = [response.text for response in example_output.outputs]
         response_token_ids = [
             [int(token_id) for token_id in response.token_ids]
+            for response in example_output.outputs
+        ]
+        finish_reasons = [
+            str(response.finish_reason) if response.finish_reason is not None else None
             for response in example_output.outputs
         ]
         # Prefer the token ids vLLM actually consumed; fall back to the HF
@@ -250,13 +258,15 @@ def run_behavioral_stability(
                 {
                     "response": response,
                     "token_ids": token_ids,
+                    "finish_reason": finish_reason,
                     "behavior": behavior,
                     "thinking_content": thinking_content,
                     "answer_content": answer_content,
                 }
-                for response, token_ids, behavior, thinking_content, answer_content in zip(
+                for response, token_ids, finish_reason, behavior, thinking_content, answer_content in zip(
                     responses,
                     response_token_ids,
+                    finish_reasons,
                     behaviors,
                     thinking_contents,
                     answer_contents,
@@ -316,6 +326,8 @@ def run_behavioral_stability(
         "seed": seed,
         "sampling_seed": sampling_seed,
         "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "multi_gpu": multi_gpu,
         "max_model_len": effective_max_model_len,
         "behavior_scoring_enabled": behavior_scoring_enabled,
@@ -376,6 +388,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--temperature", type=float, default=1.0, help="Temperature for sampling."
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Nucleus sampling cutoff. Qwen3's recommended thinking-mode decoding "
+            "is temperature 0.6, top_p 0.95, top_k 20; this repo defaults to "
+            "temperature 1.0 with no truncation to maximize rollout diversity."
+        ),
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=-1, help="Top-k sampling cutoff (-1 disables)."
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -458,6 +483,8 @@ if __name__ == "__main__":
         "multi_gpu": args.multi_gpu,
         "max_model_len": args.max_model_len,
         "skip_behavior_scoring": args.skip_behavior_scoring,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
     }
 
     if args.dataset is None:
@@ -489,7 +516,12 @@ if __name__ == "__main__":
         output_dir = f"results/behavioral_stability/{short_model_name}/modified_model/top_{match.group(1)}/m{match.group(3)}/{args.dataset}/{match.group(2)}_heads"
 
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"n{args.subset if args.subset else 'full'}_nsamp{args.num_samples}_l{args.max_new_tokens}_{decoder}_s{args.seed}_ss{args.sampling_seed}_t{args.temperature}{'_no_reasoning' if args.disable_reasoning else ''}_results.json"
+    # Non-default nucleus/top-k settings are part of the filename so
+    # sampling-sensitivity runs cannot overwrite each other.
+    sampling_suffix = ""
+    if args.top_p != 1.0 or args.top_k != -1:
+        sampling_suffix = f"_tp{args.top_p}_tk{args.top_k}"
+    filename = f"n{args.subset if args.subset else 'full'}_nsamp{args.num_samples}_l{args.max_new_tokens}_{decoder}_s{args.seed}_ss{args.sampling_seed}_t{args.temperature}{sampling_suffix}{'_no_reasoning' if args.disable_reasoning else ''}_results.json"
     output_file = os.path.join(output_dir, filename)
 
     run_behavioral_stability(
@@ -510,4 +542,6 @@ if __name__ == "__main__":
         args.dataset_path,
         args.skip_behavior_scoring,
         args.max_model_len,
+        args.top_p,
+        args.top_k,
     )

@@ -214,8 +214,10 @@ class BuildRolloutRecordTest(unittest.TestCase):
         )
 
         prompt_length = len(prompt_token_ids)
+        # First requested position is the prompt-end (context) token.
         self.assertEqual(
-            captured["boundary_token_positions"], [prompt_length + 3, prompt_length + 5]
+            captured["boundary_token_positions"],
+            [prompt_length - 1, prompt_length + 3, prompt_length + 5],
         )
         self.assertEqual(
             captured["mean_span"], (prompt_length + 8, prompt_length + 10)
@@ -227,6 +229,7 @@ class BuildRolloutRecordTest(unittest.TestCase):
         )
         self.assertEqual(record["rollout_index"], 2)
         self.assertEqual(record["cot_activations"].shape, (2, 2, 4))
+        self.assertEqual(record["context_activations"].shape, (2, 4))
         self.assertEqual(record["cot_progress"].tolist(), [0.5, 1.0])
         self.assertEqual(record["assistant_axis_score"], 6.0)  # sum(0..3)
         self.assertEqual(record["persona_coordinates"].tolist(), [0.0, 1.0])
