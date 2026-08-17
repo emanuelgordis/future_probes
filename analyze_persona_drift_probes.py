@@ -643,8 +643,13 @@ def _shuffle_rows(
     grouped_row_order = np.concatenate(
         [rows_by_group[group] for group in unique_groups]
     )
+    # Reject the identity permutation: with few groups it is drawn often
+    # (1/k! chance) and would contaminate the control with the real targets.
+    permutation = rng.permutation(unique_groups)
+    while len(unique_groups) > 1 and np.array_equal(permutation, unique_groups):
+        permutation = rng.permutation(unique_groups)
     permuted_blocks = np.concatenate(
-        [targets[rows_by_group[group]] for group in rng.permutation(unique_groups)]
+        [targets[rows_by_group[group]] for group in permutation]
     )
     shuffled[grouped_row_order] = permuted_blocks
     return shuffled

@@ -429,3 +429,15 @@ class ControlsAndBaselinesTest(unittest.TestCase):
                 "--splits", "cross_prompt", "--cross-group", "conversation",
             ])
         self.assertEqual(exit_code, 0)
+
+    def test_cross_shuffle_never_returns_identity(self):
+        from analyze_persona_drift_probes import _shuffle_rows
+
+        groups = np.asarray(["a", "a", "b"], dtype=object)
+        targets = np.asarray([[1.0], [2.0], [9.0]])
+        for seed in range(30):  # identity would appear ~50% of the time
+            rng = np.random.default_rng(seed)
+            shuffled = _shuffle_rows(targets, groups, rng, within_group=False)
+            self.assertFalse(
+                np.array_equal(shuffled, targets), f"identity at seed {seed}"
+            )
