@@ -46,17 +46,44 @@ def run_behavioral_stability(
     disable_reasoning,
     ensure_thinking,
     model_path,
+    dataset_path=None,
+    skip_behavior_scoring=False,
+    max_model_len=None,
 ):
     dataset = get_dataset(
         dataset_name,
-        subset,
+        subset=subset,
         icl_examples=None,
         seed=seed,
         disable_reasoning=disable_reasoning,
+        dataset_path=dataset_path,
     )
 
+    dataset_supports_behavior_scoring = getattr(
+        dataset, "supports_behavior_scoring", True
+    )
+    behavior_scoring_enabled = (
+        dataset_supports_behavior_scoring and not skip_behavior_scoring
+    )
+    if not behavior_scoring_enabled:
+        reason = (
+            "the dataset has no binary behavior labels"
+            if not dataset_supports_behavior_scoring
+            else "--skip_behavior_scoring was set"
+        )
+        print(f"Behavior scoring disabled because {reason}.")
+
+    # Existing short, single-turn datasets retain their memory-saving 2k prompt
+    # allowance.  Persona-drift histories are much longer, so let vLLM use the
+    # model's configured context length unless the caller supplies an explicit cap.
+    effective_max_model_len = max_model_len
+    if effective_max_model_len is None and not getattr(
+        dataset, "requires_long_context", False
+    ):
+        effective_max_model_len = max_new_tokens + 2000
+
     model, tokenizer, lora_request = get_vllm_model_and_tokenizer(
-        model_name, multi_gpu=multi_gpu, max_model_len=max_new_tokens + 2000
+        model_name, multi_gpu=multi_gpu, max_model_len=effective_max_model_len
     )
 
     sampling_params = vllm.SamplingParams(
@@ -105,6 +132,20 @@ def run_behavioral_stability(
         )
 
         responses = [response.text for response in example_output.outputs]
+        response_token_ids = [
+            [int(token_id) for token_id in response.token_ids]
+            for response in example_output.outputs
+        ]
+        # Prefer the token ids vLLM actually consumed; fall back to the HF
+        # chat-template tokenization (verified identical for Qwen3, which has
+        # no BOS token) for engines that do not report prompt ids.
+        if getattr(example_output, "prompt_token_ids", None):
+            prompt_token_ids = list(example_output.prompt_token_ids)
+        elif isinstance(input_ids, torch.Tensor):
+            prompt_token_ids = input_ids.detach().cpu().reshape(-1).tolist()
+        else:
+            prompt_token_ids = list(input_ids)
+        prompt_token_ids = [int(token_id) for token_id in prompt_token_ids]
 
         if "gpt-oss" in model_name:
             # GPT-oss uses harmony format
@@ -152,12 +193,14 @@ def run_behavioral_stability(
                 for response in responses
             ]
         else:
+            # Split at the LAST </think>, matching Qwen3's reference parsing;
+            # a spurious early close must not leak CoT into the answer.
             thinking_contents = [
-                response.split("</think>")[0] if "</think>" in response else ""
+                response.rsplit("</think>", 1)[0] if "</think>" in response else ""
                 for response in responses
             ]
             answer_contents = [
-                response.split("</think>")[1] if "</think>" in response else response
+                response.rsplit("</think>", 1)[1] if "</think>" in response else response
                 for response in responses
             ]
 
@@ -175,59 +218,97 @@ def run_behavioral_stability(
                 )
                 print("--------------------------------")
 
-        # We check for the behavior only in the answer content. For the non-reasoning models its just the full answer. The thinking is private.
-        examples = [example] * len(answer_contents)
-        behaviors = dataset.detect_behavior_batched(examples, answer_contents)
-        behaviors = [
-            int(behavior) if behavior is not None else behavior
-            for behavior in behaviors
-        ]
+        if behavior_scoring_enabled:
+            # Behavior is evaluated only on the public final answer; thinking is private.
+            examples = [example] * len(answer_contents)
+            behaviors = dataset.detect_behavior_batched(examples, answer_contents)
+            behaviors = [
+                int(behavior) if behavior is not None else behavior
+                for behavior in behaviors
+            ]
+            int_behaviors = [behavior for behavior in behaviors if behavior is not None]
+            average_behavior = sum(int_behaviors) / (len(int_behaviors) or 1)
+            first_behavior = behaviors[0]
+            worst_behavior = max(int_behaviors) if int_behaviors else None
+        else:
+            behaviors = [None] * len(answer_contents)
+            average_behavior = None
+            first_behavior = None
+            worst_behavior = None
 
-        int_behaviors = [b for b in behaviors if b is not None]
-
-        average_behavior = sum(int_behaviors) / (len(int_behaviors) or 1)
         average_behaviors.append(average_behavior)
-
-        first_behavior = behaviors[0]
         first_behaviors.append(first_behavior)
-
-        worst_behavior = max(int_behaviors) if int_behaviors else None
         worst_behaviors.append(worst_behavior)
 
-        outputs_to_save.append(
-            {
-                "input_prompt": input_prompt,
-                "responses": [
-                    {
-                        "response": response,
-                        "behavior": behavior,
-                        "thinking_content": thinking_content,
-                        "answer_content": answer_content,
-                    }
-                    for response, behavior, thinking_content, answer_content in zip(
-                        responses, behaviors, thinking_contents, answer_contents
-                    )
-                ],
-                "average_behavior": average_behavior,
-                "worst_behavior": worst_behavior,
-                "first_behavior": first_behavior,
-            }
+        output_record = {
+            "input_prompt": input_prompt,
+            # Preserve the exact prompt/completion tokenization used for generation.
+            # Activation gathering can then replay the rollout without silently
+            # changing BPE boundaries by re-tokenizing concatenated text.
+            "prompt_token_ids": prompt_token_ids,
+            "responses": [
+                {
+                    "response": response,
+                    "token_ids": token_ids,
+                    "behavior": behavior,
+                    "thinking_content": thinking_content,
+                    "answer_content": answer_content,
+                }
+                for response, token_ids, behavior, thinking_content, answer_content in zip(
+                    responses,
+                    response_token_ids,
+                    behaviors,
+                    thinking_contents,
+                    answer_contents,
+                )
+            ],
+            "average_behavior": average_behavior,
+            "worst_behavior": worst_behavior,
+            "first_behavior": first_behavior,
+        }
+        if "messages" in example:
+            output_record["messages"] = example["messages"]
+        metadata_keys = getattr(dataset, "output_metadata_keys", ())
+        metadata = {key: example[key] for key in metadata_keys if key in example}
+        if metadata:
+            output_record["metadata"] = metadata
+        outputs_to_save.append(output_record)
+
+    total_response_count = sum(
+        len(example_output["responses"]) for example_output in outputs_to_save
+    )
+    if behavior_scoring_enabled:
+        print(f"Average behaviors: {average_behaviors}")
+        total_avg_behavior = sum(average_behaviors) / (len(average_behaviors) or 1)
+        print(f"Total average behavior: {total_avg_behavior}")
+
+        all_behaviors_flat = [
+            response["behavior"]
+            for example_output in outputs_to_save
+            for response in example_output["responses"]
+        ]
+        none_behavior_count = sum(
+            1 for behavior in all_behaviors_flat if behavior is None
         )
-
-    print(f"Average behaviors: {average_behaviors}")
-    total_avg_behavior = sum(average_behaviors) / (len(average_behaviors) or 1)
-    print(f"Total average behavior: {total_avg_behavior}")
-
-    all_behaviors_flat = [r["behavior"] for ex in outputs_to_save for r in ex["responses"]]
-    none_behavior_count = sum(1 for b in all_behaviors_flat if b is None)
-    total_response_count = len(all_behaviors_flat)
-    none_behavior_fraction = none_behavior_count / total_response_count if total_response_count > 0 else 0.0
-    print(f"None behavior fraction: {none_behavior_fraction:.4f} ({none_behavior_count}/{total_response_count})")
+        none_behavior_fraction = (
+            none_behavior_count / total_response_count
+            if total_response_count > 0
+            else 0.0
+        )
+        print(
+            f"None behavior fraction: {none_behavior_fraction:.4f} "
+            f"({none_behavior_count}/{total_response_count})"
+        )
+    else:
+        total_avg_behavior = None
+        none_behavior_count = None
+        none_behavior_fraction = None
 
     results = {
         "model_name": model_name,
         "disable_reasoning": disable_reasoning,
         "dataset_name": dataset_name,
+        "dataset_path": dataset_path,
         "subset": subset,
         "num_samples": num_samples,
         "max_new_tokens": max_new_tokens,
@@ -236,6 +317,8 @@ def run_behavioral_stability(
         "sampling_seed": sampling_seed,
         "temperature": temperature,
         "multi_gpu": multi_gpu,
+        "max_model_len": effective_max_model_len,
+        "behavior_scoring_enabled": behavior_scoring_enabled,
         "average_behaviors": repr(average_behaviors),
         "worst_behaviors": repr(worst_behaviors),
         "first_behaviors": repr(first_behaviors),
@@ -254,7 +337,8 @@ def run_behavioral_stability(
         json.dump(outputs_to_save, f, indent=4)
     print(f"Saved outputs to {outputs_file}")
 
-    plot_behavioral_stability(results_file)
+    if behavior_scoring_enabled:
+        plot_behavioral_stability(results_file)
 
 
 
@@ -275,6 +359,16 @@ if __name__ == "__main__":
         "--dataset", type=str, default=None, help="Name of the dataset."
     )
     parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional local dataset file or directory. Persona-drift accepts either "
+            "a transcript JSON/JSONL file, its containing directory, or an Assistant "
+            "Axis repository checkout."
+        ),
+    )
+    parser.add_argument(
         "--subset", type=int, default=None, help="Subset of the dataset to use."
     )
     parser.add_argument(
@@ -288,6 +382,23 @@ if __name__ == "__main__":
         type=int,
         default=128,
         help="Maximum number of tokens to generate.",
+    )
+    parser.add_argument(
+        "--max_model_len",
+        type=int,
+        default=None,
+        help=(
+            "vLLM context-length cap, including prompt and generation. Long-context "
+            "datasets use the model default when this is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--skip_behavior_scoring",
+        action="store_true",
+        help=(
+            "Skip dataset behavior detection and behavior-stability plotting. This is "
+            "automatic for persona-drift datasets."
+        ),
     )
     parser.add_argument(
         "--disable_reasoning",
@@ -339,11 +450,14 @@ if __name__ == "__main__":
     experiment_config = {
         "model_name": args.model_name,
         "dataset": args.dataset,
+        "dataset_path": args.dataset_path,
         "subset": args.subset,
         "seed": args.seed,
         "temperature": args.temperature,
         "num_samples": args.num_samples,
         "multi_gpu": args.multi_gpu,
+        "max_model_len": args.max_model_len,
+        "skip_behavior_scoring": args.skip_behavior_scoring,
     }
 
     if args.dataset is None:
@@ -393,6 +507,7 @@ if __name__ == "__main__":
         args.disable_reasoning,
         args.ensure_thinking,
         args.model_path,
+        args.dataset_path,
+        args.skip_behavior_scoring,
+        args.max_model_len,
     )
-
-

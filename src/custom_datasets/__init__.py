@@ -17,6 +17,7 @@ from src.custom_datasets import (
     wealth_seeking_inclination,
     survival_instinct,
     myopic_reward,
+    persona_drift,
 )
 
 
@@ -26,8 +27,17 @@ def get_dataset(
     icl_examples: int = None,
     seed: int = None,
     disable_reasoning: bool = False,
+    dataset_path: str = None,
 ):
-    if dataset_name.startswith("sep"):
+    if dataset_name.startswith("persona_drift"):
+        dataset = persona_drift.PersonaDriftDataset(
+            dataset_name,
+            subset=subset,
+            seed=seed,
+            disable_reasoning=disable_reasoning,
+            data_path=dataset_path,
+        )
+    elif dataset_name.startswith("sep"):
         dataset = sep.SEPDataset(
             dataset_name, subset=subset, seed=seed, disable_reasoning=disable_reasoning
         )

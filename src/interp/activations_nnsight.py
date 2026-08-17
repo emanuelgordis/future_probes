@@ -5,6 +5,116 @@ import transformers
 from typing import Optional
 
 
+def _get_num_hidden_layers(wrapped_model) -> int:
+    config = wrapped_model.model.config
+    if hasattr(config, "text_config") and hasattr(config.text_config, "num_hidden_layers"):
+        return int(config.text_config.num_hidden_layers)
+    return int(config.num_hidden_layers)
+
+
+def _get_decoder_layers(wrapped_model):
+    if hasattr(wrapped_model.model, "language_model"):
+        return wrapped_model.model.language_model.layers
+    return wrapped_model.model.layers
+
+
+def extract_boundary_and_span_activations(
+    wrapped_model,
+    input_ids: torch.Tensor,
+    boundary_token_positions,
+    layer_indices,
+    *,
+    mean_span: tuple[int, int],
+    mean_layer: int,
+    output_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract CoT boundary states and one answer-span mean in a single trace.
+
+    Args:
+        wrapped_model: ``nnsight.LanguageModel`` wrapping a causal LM.
+        input_ids: A single full prompt + rollout, shape ``[1, sequence]``.
+        boundary_token_positions: Full-sequence token indices at CoT step ends.
+        layer_indices: Decoder layers to gather at every boundary.
+        mean_span: Half-open full-sequence token span for the public final answer.
+        mean_layer: Layer at which to average the final-answer activations.
+        output_dtype: CPU storage dtype for the returned activation tensors.
+
+    Returns:
+        ``(boundary_activations, answer_mean_activation)`` with shapes
+        ``[boundaries, layers, hidden]`` and ``[hidden]`` respectively.
+
+    Only selected boundary positions are copied for the CoT, avoiding the very
+    large ``[layers, full_sequence, hidden]`` tensor that Qwen3-32B would create.
+    """
+
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise ValueError("input_ids must be a rank-2 torch.Tensor")
+    if input_ids.shape[0] != 1:
+        raise ValueError("Boundary extraction currently requires batch size 1")
+
+    positions = [int(position) for position in boundary_token_positions]
+    layers = [int(layer) for layer in layer_indices]
+    if not positions:
+        raise ValueError("At least one CoT boundary token position is required")
+    if not layers:
+        raise ValueError("At least one extraction layer is required")
+    if len(set(layers)) != len(layers):
+        raise ValueError("layer_indices must not contain duplicates")
+
+    sequence_length = int(input_ids.shape[1])
+    if any(position < 0 or position >= sequence_length for position in positions):
+        raise IndexError(
+            f"Boundary positions must lie in [0, {sequence_length}), got {positions}"
+        )
+    answer_start, answer_end = (int(mean_span[0]), int(mean_span[1]))
+    if not 0 <= answer_start < answer_end <= sequence_length:
+        raise IndexError(
+            f"mean_span must be a non-empty half-open span inside [0, {sequence_length}], "
+            f"got {(answer_start, answer_end)}"
+        )
+
+    num_layers = _get_num_hidden_layers(wrapped_model)
+    requested = [*layers, int(mean_layer)]
+    if any(layer < 0 or layer >= num_layers for layer in requested):
+        raise IndexError(
+            f"Requested layers must lie in [0, {num_layers}), got {requested}"
+        )
+
+    input_ids = input_ids.to(wrapped_model.model.device)
+    layers_module = _get_decoder_layers(wrapped_model)
+    # nnsight executes the trace body in its own scope: rebinding local names
+    # inside it does not escape, but mutating these pre-existing containers does
+    # (the same pattern extract_prompt_activations relies on).
+    boundary_by_layer = {}
+    answer_mean_holder = []
+    ordered_layers = list(dict.fromkeys(requested))
+
+    with torch.no_grad():
+        with wrapped_model.trace(input_ids):
+            for layer in ordered_layers:
+                full_layer_output = layers_module[layer].output
+                if layer in layers:
+                    boundary_by_layer[layer] = full_layer_output[
+                        0, positions, :
+                    ].cpu()
+                if layer == mean_layer:
+                    answer_mean_holder.append(
+                        full_layer_output[0, answer_start:answer_end, :]
+                        .mean(dim=0)
+                        .cpu()
+                    )
+
+    if not answer_mean_holder:  # Defensive; mean_layer is always in ordered_layers.
+        raise RuntimeError("Answer mean activation was not captured")
+    boundary_activations = torch.stack(
+        [boundary_by_layer[layer] for layer in layers], dim=1
+    ).detach().clone().to(dtype=output_dtype)
+    answer_mean_activation = (
+        answer_mean_holder[0].detach().clone().to(dtype=torch.float32)
+    )
+    return boundary_activations, answer_mean_activation
+
+
 def extract_prompt_activations(wrapped_model, input_ids, full_sequence: bool = False, extraction_layer: int = None):
     """Extract the residual stream activations before the first generated token at all layers.
     If full_sequence is True, extract the activations for the full prompt sequence (each token).
