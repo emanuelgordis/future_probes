@@ -220,24 +220,32 @@ class CheckpointExclusionTest(unittest.TestCase):
 
 
 class ControlsAndBaselinesTest(unittest.TestCase):
-    def test_cross_shuffle_is_a_block_permutation(self):
+    def test_cross_shuffle_is_a_marginal_preserving_block_permutation(self):
         from analyze_persona_drift_probes import _shuffle_rows
 
-        rng = np.random.default_rng(0)
         groups = np.asarray(["a", "a", "a", "b", "b", "c"], dtype=object)
         targets = np.asarray([[1.0], [2.0], [3.0], [10.0], [20.0], [100.0]])
-        shuffled = _shuffle_rows(targets, groups, rng, within_group=False)
-        # Every destination group's rows must come from a single source group
-        # (cycled), preserving within-group target structure.
-        by_group = {"a": {1.0, 2.0, 3.0}, "b": {10.0, 20.0}, "c": {100.0}}
-        for group in ("a", "b", "c"):
-            rows = shuffled[groups == group].reshape(-1)
-            sources = [
-                source
-                for source, values in by_group.items()
-                if set(np.unique(rows)) <= values
-            ]
-            self.assertEqual(len(sources), 1, f"group {group} mixes sources: {rows}")
+        blocks = {"a": [1.0, 2.0, 3.0], "b": [10.0, 20.0], "c": [100.0]}
+        for seed in range(6):
+            rng = np.random.default_rng(seed)
+            shuffled = _shuffle_rows(targets, groups, rng, within_group=False)
+            # A true permutation: every target appears exactly once.
+            self.assertEqual(
+                sorted(shuffled.reshape(-1).tolist()),
+                sorted(targets.reshape(-1).tolist()),
+            )
+            # In grouped row order, the sequence is intact blocks in some order.
+            sequence = shuffled.reshape(-1).tolist()  # rows already group-ordered
+            remaining, order = sequence, []
+            while remaining:
+                for name, block in blocks.items():
+                    if remaining[: len(block)] == block and name not in order:
+                        order.append(name)
+                        remaining = remaining[len(block) :]
+                        break
+                else:
+                    self.fail(f"sequence {sequence} is not a block concatenation")
+            self.assertEqual(sorted(order), ["a", "b", "c"])
 
     def test_context_cell_probes_prompt_end_state(self):
         from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
@@ -279,6 +287,46 @@ class ControlsAndBaselinesTest(unittest.TestCase):
             cot_cell["metrics"]["probe"]["assistant_axis"]["r2"]["mean"],
             context_cell["metrics"]["probe"]["assistant_axis"]["r2"]["mean"],
         )
+
+    def test_fixed_cohort_matches_context_cell_cohort(self):
+        from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
+
+        rng = np.random.default_rng(5)
+        trajectories = []
+        for prompt_index in range(4):
+            for rollout_index in range(3):
+                late = rollout_index == 0
+                progress = np.asarray([0.7, 1.0]) if late else np.asarray([0.3, 1.0])
+                target = float(prompt_index)
+                acts = rng.normal(size=(2, 3))
+                trajectories.append(
+                    RolloutTrajectory(
+                        prompt_id=f"p{prompt_index}",
+                        conversation_id=f"p{prompt_index}",
+                        rollout_id=f"p{prompt_index}r{rollout_index}",
+                        layer_activations={0: acts},
+                        progress=progress,
+                        assistant_axis=target,
+                        persona_coordinates=np.asarray([target]),
+                        context_activations={0: rng.normal(size=3)},
+                    )
+                )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=2,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="prompt",
+            evaluation_fraction=0.25, split_repeats=1, regressor="ridge",
+            ridge_alpha=1.0, shuffle_repeats=1, seed=0,
+            cohort="fixed", include_context=True,
+        )
+        excluded = {
+            (cell["input"], cell["time_bin"]): cell["split_diagnostics"][0][
+                "n_excluded_no_boundary"
+            ]
+            for cell in results
+        }
+        # Context and every CoT bin share the fixed cohort (4 late rollouts out).
+        self.assertEqual(set(excluded.values()), {4})
 
     def test_fixed_cohort_restricts_all_bins(self):
         from analyze_persona_drift_probes import RolloutTrajectory, run_analysis

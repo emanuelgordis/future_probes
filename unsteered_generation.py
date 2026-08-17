@@ -510,7 +510,12 @@ if __name__ == "__main__":
         output_dir = f"results/behavioral_stability/{short_model_name}/modified_model/top_{match.group(1)}/m{match.group(3)}/{args.dataset}/{match.group(2)}_heads"
 
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"n{args.subset if args.subset else 'full'}_nsamp{args.num_samples}_l{args.max_new_tokens}_{decoder}_s{args.seed}_ss{args.sampling_seed}_t{args.temperature}{'_no_reasoning' if args.disable_reasoning else ''}_results.json"
+    # Non-default nucleus/top-k settings are part of the filename so
+    # sampling-sensitivity runs cannot overwrite each other.
+    sampling_suffix = ""
+    if args.top_p != 1.0 or args.top_k != -1:
+        sampling_suffix = f"_tp{args.top_p}_tk{args.top_k}"
+    filename = f"n{args.subset if args.subset else 'full'}_nsamp{args.num_samples}_l{args.max_new_tokens}_{decoder}_s{args.seed}_ss{args.sampling_seed}_t{args.temperature}{sampling_suffix}{'_no_reasoning' if args.disable_reasoning else ''}_results.json"
     output_file = os.path.join(output_dir, filename)
 
     run_behavioral_stability(

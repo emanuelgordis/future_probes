@@ -617,11 +617,10 @@ def _shuffle_rows(
     """Shuffle targets for the control probe.
 
     ``within_group=True`` permutes rows inside every group (the within-prompt
-    control).  ``within_group=False`` performs a *block* permutation: whole
-    groups swap target blocks (cycled to the destination size), which preserves
-    within-group target correlation.  A plain row-level permutation would
-    destroy that correlation and make the control probe artificially easy to
-    beat when targets are group-correlated.
+    control).  ``within_group=False`` performs a *block* permutation that
+    preserves within-group target correlation.  A plain row-level permutation
+    would destroy that correlation and make the control probe artificially easy
+    to beat when targets are group-correlated.
     """
 
     if within_group:
@@ -631,17 +630,23 @@ def _shuffle_rows(
             shuffled[rows] = targets[rng.permutation(rows)]
         return shuffled
 
+    # True permutation for unequal block sizes: concatenate intact group blocks
+    # in a permuted order over the grouped row layout.  Every target appears
+    # exactly once (marginals preserved), within-group runs stay contiguous,
+    # and group boundaries misalign with the destination groups — the intended
+    # null under cluster dependence.
     shuffled = np.empty_like(targets)
     unique_groups = np.unique(group_ids)
-    permuted = rng.permutation(unique_groups)
     rows_by_group = {
         group: np.flatnonzero(group_ids == group) for group in unique_groups
     }
-    for destination, source in zip(unique_groups, permuted):
-        destination_rows = rows_by_group[destination]
-        source_rows = rows_by_group[source]
-        cycled = source_rows[np.arange(len(destination_rows)) % len(source_rows)]
-        shuffled[destination_rows] = targets[cycled]
+    grouped_row_order = np.concatenate(
+        [rows_by_group[group] for group in unique_groups]
+    )
+    permuted_blocks = np.concatenate(
+        [targets[rows_by_group[group]] for group in rng.permutation(unique_groups)]
+    )
+    shuffled[grouped_row_order] = permuted_blocks
     return shuffled
 
 
@@ -1089,14 +1094,22 @@ def run_analysis(
             ).astype(np.float64)
             # The context (prompt-end) probe is the context-only baseline: it
             # measures how much of the persona target is already predictable
-            # before any reasoning token is generated.
+            # before any reasoning token is generated.  Under --cohort fixed it
+            # uses the same cohort as every CoT bin, making all incremental
+            # comparisons cohort-matched; under per_bin only the final bin
+            # (where every rollout has a boundary) is cohort-matched to it.
+            context_valid = (
+                fixed_cohort_valid
+                if cohort == "fixed"
+                else np.ones(len(trajectories), dtype=bool)
+            )
             evaluate_cell(
                 layer,
                 "context",
                 -1,
                 0.0,
                 X_context,
-                np.ones(len(trajectories), dtype=bool),
+                context_valid,
                 seed_offset=time_bins,
             )
 
