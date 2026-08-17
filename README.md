@@ -76,9 +76,9 @@ uv run unsteered_generation.py \
     --num_samples 8 \
     --max_new_tokens 4096 \
     --temperature 1.0 \
-    --max_model_len 16384
+    --max_model_len 12288
 ```
-Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap (the 40k default does not leave enough KV-cache memory next to the bf16 weights); 16384 comfortably covers the longest transcript prefix (~8k tokens) plus generation.
+Results land in `results/behavioral_stability/Qwen3-32B/base_model/persona_drift/…_results.json` (plus `…_outputs.json`). Long conversation prefixes are allowed: for `requires_long_context` datasets the vLLM context defaults to the model maximum rather than the short-prompt cap. On a single 80 GB GPU, Qwen3-32B needs an explicit `--max_model_len` cap: the 40k default leaves too little KV-cache memory next to the bf16 weights, and even 16384 fails during vLLM's memory-profiling pass (the profile batch scales with the cap). 12288 is the validated setting and exactly covers the longest transcript prefix (8,178 tokens) plus `--max_new_tokens 4096`.
 
 ## Stage 2 — Scoring answers in the Assistant Axis persona space
 
