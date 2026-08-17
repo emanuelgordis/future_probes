@@ -156,14 +156,14 @@ This writes a single `…_persona_activations.pt` (version-1 format):
 
 ### Probe
 
-For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average); rollouts whose first sentence ends after *t* are excluded from that cell rather than represented by a future state, so early checkpoints never see later reasoning (note the evaluated cohort then changes across bins; `--cohort fixed` restricts every bin to rollouts valid at all checkpoints for a constant cohort). The ridge penalty can be tuned on training data only via `--ridge-alphas`, selected per fit by grouped cross-validation. Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
+For every (layer, reasoning-time checkpoint) cell we fit a **multi-output ridge regression** from the CoT boundary state to the target vector `[assistant_axis_score, persona_coordinates…]`, with a standardization step on the inputs. (Targets — and the shuffled control targets — are columns of one joint solve; multi-output least squares/ridge with a shared design decomposes into independent per-target fits [27], the same vectorization voxelwise encoding models use to fit thousands of targets at once [28].) Ridge probes [21] are the standard choice for reading *continuous* quantities out of residual-stream activations — Gurnee & Tegmark use exactly L2-regularized linear probes to read continuous space/time coordinates from layer activations [5]; linear probes in general follow Alain & Bengio [3]. Reasoning time is normalized: checkpoint *t* ∈ (0,1] uses the boundary state at the last sentence completed within the first *t* fraction of thinking tokens (`--trajectory-representation latest`, or `cumulative_mean` for a running average); rollouts whose first sentence ends after *t* are excluded from that cell rather than represented by a future state, so early checkpoints never see later reasoning (note the evaluated cohort then changes across bins; `--cohort fixed` restricts every bin to rollouts valid at all checkpoints for a constant cohort). The ridge penalty can be tuned on training data only via `--ridge-alphas`, selected per fit by grouped cross-validation. Analyzing predictability as a function of position within the CoT follows [2, 11, 12, 13].
 
 ### Evaluations: cross-prompt and within-prompt
 
 Two complementary splits, mirroring the two sources of variation in the data:
 
 - **`cross_prompt`** holds out entire conversations by default (`--cross-group conversation`): because persona-drift prompts are nested prefixes of one transcript, holding out single prompts (`--cross-group prompt`) would leak conversation identity between train and evaluation. This measures whether a probe transfers to unseen conversations — grouped held-out evaluation guards against the probe memorizing prompt or conversation identity, one of the standard confounds in probing methodology [4, 9].
-- **`within_prompt`** holds out stochastic rollouts *inside* each prompt, and centers both activations and targets by their *training-rollout* prompt means. Metrics are computed in this prompt-residual space, so the probe only gets credit for predicting *which way this particular rollout deviates* from the prompt's average persona — the per-question analogue of how self-verification probes predict the outcome of an individual reasoning trajectory [11, 12].
+- **`within_prompt`** holds out stochastic rollouts *inside* each prompt, and centers both activations and targets by their *training-rollout* prompt means. Metrics are computed in this prompt-residual space, so the probe only gets credit for predicting *which way this particular rollout deviates* from the prompt's average persona — the per-question analogue of how self-verification probes predict the outcome of an individual reasoning trajectory [11, 12]. The centering itself is the classical within-transformation of panel-data econometrics [25]; per-prompt-group normalization of activations is likewise how CCS [23] and Cluster-Norm [24] keep probes from latching onto prompt/context identity, the dominant-feature failure mode documented by Farquhar et al. [29].
 
 ### Baselines and controls
 
@@ -172,7 +172,7 @@ Every probe result is reported against:
 - **`context` probe cells** — for every layer, the same probe fitted on the **prompt-end activation** (before any reasoning token). This is the context-only baseline: the auditor-generated history itself carries persona/topic cues, so a CoT cell only demonstrates *incremental* predictive power by beating the context cell at the same layer. (Persona-vector work shows pooled correlations can be dominated by between-condition prompt differences [14] — this baseline separates them.)
 - **`prompt_mean`** — predict each prompt's training-rollout mean target. Meaningful for `within_prompt`; under cross-prompt holdout every evaluation prompt is unseen, so `prompt_mean` degenerates to `global_mean` there — use the context probe as the cross-prompt context baseline.
 - **`global_mean`** — predict the global training mean,
-- **`target_shuffled_probe`** — the identical probe refit on permuted targets, following the control-task methodology of Hewitt & Liang [4]. For cross-prompt evaluation the permutation is a **block permutation over conversations** (whole groups swap target blocks), preserving within-conversation target correlation so the control is not artificially easy to beat; for within-prompt it permutes rollouts inside each prompt.
+- **`target_shuffled_probe`** — the identical probe refit on permuted targets, following the control-task methodology of Hewitt & Liang [4]. For cross-prompt evaluation the permutation is a **block permutation over conversations** (whole groups swap target blocks), preserving within-conversation target correlation so the control is not artificially easy to beat — the exchangeability-block / multi-level block permutation practice of permutation inference for clustered data [26]; for within-prompt it permutes rollouts inside each prompt.
 
 Metrics: **R²**, **MAE**, and **Pearson r** per target, plus persona-space macro averages — R² for continuous probe targets follows [5], MAE follows [2]. Repeated splits (`--split-repeats`) report mean ± std.
 
@@ -205,8 +205,10 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 | Sentence = CoT step; probe end-of-sentence tokens | Kortukov et al. [2]; Thought Anchors [10] |
 | Punkt sentence segmentation | Kiss & Strunk [19] |
 | Ridge probes for continuous targets, layer sweep | Gurnee & Tegmark [5]; Alain & Bengio [3]; Hoerl & Kennard [21] |
-| Shuffled-target control probes (conversation-block permutation) | Hewitt & Liang control tasks [4] |
+| Shuffled-target control probes (conversation-block permutation) | Hewitt & Liang control tasks [4]; block permutation for clustered data [26] |
 | Context-only (prompt-end) baseline probe | incremental-validity control; prompt-driven vs. emergent persona shifts [14] |
+| Within-prompt centering of X and y by training prompt means | within/fixed-effects transformation [25]; per-prompt normalization in CCS [23] and Cluster-Norm [24] |
+| Joint multi-output solve (targets + controls as columns) | per-target independence of multi-output ridge [27]; voxelwise encoding models [28] |
 | Conversation-grouped held-out splits; leakage caveats | Belinkov [9] |
 | Within-prompt residual evaluation (predicting a single trajectory's outcome) | self-verification / temporal-outcome probing [11, 12] |
 | Score only the public answer; thinking stays private | upstream convention [2]; Qwen3 usage [17] |
@@ -217,7 +219,7 @@ The JSON report contains one entry per (split, layer, time-bin) with probe/basel
 
 - **The persona target is an activation-space proxy.** Final answers are scored by the same model's layer-32 activations projected into the Assistant Axis space. The axis itself is behaviorally validated upstream (role-play adherence judging, capping evaluations) [1], but this pipeline includes no independent text-side persona judge of *our* answers; PC2+ coordinates are exploratory. Adding an LLM-judge scoring of answer text is the natural validation step.
 - **Prediction is not causation, and CoT text may be unfaithful.** A probe reading persona from CoT states shows the information is linearly present — not that the reasoning causes the persona, nor that the CoT text reflects the true process [22]. Causal claims would need interventions (e.g., steering or resampling at boundaries [2, 10]).
-- **Dependence structure.** Rollouts within a prompt and prefixes within a conversation are dependent; pooled metrics and repeated-split standard deviations are not cluster-level uncertainty estimates. With the 4 public conversations, cross-conversation cells rest on very few independent units — treat them as pilot results until the prompt set is regenerated at scale.
+- **Dependence structure.** Rollouts within a prompt and prefixes within a conversation are dependent; pooled metrics and repeated-split standard deviations are not cluster-level uncertainty estimates (nested dependence inflates apparent precision [30]). With the 4 public conversations, cross-conversation cells rest on very few independent units — treat them as pilot results until the prompt set is regenerated at scale.
 - **Reasoning-time cells are per-bin cohorts by default.** Excluding rollouts with no boundary by a checkpoint prevents future-state leakage but changes the evaluated cohort across bins (`n_excluded_no_boundary` is reported per cell; `--cohort fixed` holds the cohort constant).
 - **Report grids, not maxima.** The console prints a best-cell convenience line; it is post-selection over layers × time × splits. Conclusions should come from the full grid in the JSON report against the matched baselines and controls.
 - **Foreign-model histories.** See the estimand note in Stage 1: the public prefixes were recorded with Llama/Gemma targets.
@@ -290,3 +292,19 @@ Other top-level scripts (`behavior_distribution_analysis.py`, `gather_activation
 [21] Arthur E. Hoerl, Robert W. Kennard. **Ridge Regression: Biased Estimation for Nonorthogonal Problems.** Technometrics 12(1):55–67, 1970.
 
 [22] Miles Turpin, Julian Michael, Ethan Perez, Samuel R. Bowman. **Language Models Don't Always Say What They Think: Unfaithful Explanations in Chain-of-Thought Prompting.** NeurIPS 2023. [paper](https://arxiv.org/abs/2305.04388)
+
+[23] Collin Burns, Haotian Ye, Dan Klein, Jacob Steinhardt. **Discovering Latent Knowledge in Language Models Without Supervision.** ICLR 2023. [paper](https://arxiv.org/abs/2212.03827)
+
+[24] Walter Laurito, Sharan Maiya, Grégoire Dhimoïla, Owen Ho Wan Yeung, Kaarel Hänni. **Cluster-Norm for Unsupervised Probing of Knowledge.** EMNLP 2024. [paper](https://aclanthology.org/2024.emnlp-main.780/)
+
+[25] Yair Mundlak. **On the Pooling of Time Series and Cross Section Data.** Econometrica 46(1):69–85, 1978.
+
+[26] Anderson M. Winkler, Matthew A. Webster, Diego Vidaurre, Thomas E. Nichols, Stephen M. Smith. **Multi-level block permutation.** NeuroImage 123:253–268, 2015. (Framework: Winkler et al., *Permutation inference for the general linear model*, NeuroImage 92:381–397, 2014.)
+
+[27] Trevor Hastie, Robert Tibshirani, Jerome Friedman. **The Elements of Statistical Learning** (2nd ed.), §3.2.4 "Multiple Outputs". Springer, 2009.
+
+[28] Tom Dupré la Tour, Michael Eickenberg, Anwar O. Nunez-Elizalde, Jack L. Gallant. **Feature-space selection with banded ridge regression.** NeuroImage 264:119728, 2022.
+
+[29] Sebastian Farquhar, Vikrant Varma, Zachary Kenton, Johannes Gasteiger, Vladimir Mikulik, Rohin Shah. **Challenges with unsupervised LLM knowledge discovery.** arXiv:2312.10029, 2023. [paper](https://arxiv.org/abs/2312.10029)
+
+[30] Emmeke Aarts, Matthijs Verhage, Jesse V. Veenvliet, Conor V. Dolan, Sophie van der Sluis. **A solution to dependency: using multilevel analysis to accommodate nested data.** Nature Neuroscience 17(4):491–496, 2014.
