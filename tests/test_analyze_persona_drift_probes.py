@@ -457,3 +457,52 @@ class ControlsAndBaselinesTest(unittest.TestCase):
         scaled[:, 1] *= 1000.0  # inflate the noise target's scale
         rescaled = _select_ridge_alpha(X, scaled, groups, alphas, seed=0)
         self.assertEqual(base, rescaled)
+
+    def test_cross_shuffle_is_a_derangement(self):
+        from analyze_persona_drift_probes import _shuffle_rows
+
+        groups = np.asarray(["a", "b", "b", "c"], dtype=object)
+        targets = np.asarray([[1.0], [10.0], [20.0], [100.0]])
+        for seed in range(25):
+            rng = np.random.default_rng(seed)
+            shuffled = _shuffle_rows(targets, groups, rng, within_group=False)
+            # No group may keep its own block (fixed points rejected).
+            self.assertNotEqual(shuffled[0, 0], 1.0, f"seed {seed}: a kept its block")
+            self.assertNotEqual(
+                set(shuffled[1:3, 0]), {10.0, 20.0}, f"seed {seed}: b kept its block"
+            )
+            self.assertNotEqual(shuffled[3, 0], 100.0, f"seed {seed}: c kept its block")
+
+    def test_logo_cross_splits_hold_out_every_conversation_once(self):
+        from analyze_persona_drift_probes import RolloutTrajectory, run_analysis
+
+        rng = np.random.default_rng(9)
+        trajectories = []
+        for conversation in range(4):
+            for prompt in range(2):
+                for rollout in range(2):
+                    target = float(conversation)
+                    trajectories.append(
+                        RolloutTrajectory(
+                            prompt_id=f"c{conversation}p{prompt}",
+                            conversation_id=f"c{conversation}",
+                            rollout_id=f"c{conversation}p{prompt}r{rollout}",
+                            layer_activations={0: rng.normal(size=(1, 3))},
+                            progress=np.asarray([1.0]),
+                            assistant_axis=target,
+                            persona_coordinates=np.asarray([target]),
+                        )
+                    )
+        results = run_analysis(
+            trajectories, ["coordinate"], layers=[0], time_bins=1,
+            trajectory_representation="latest",
+            split_kinds=["cross_prompt"], cross_group="conversation",
+            evaluation_fraction=0.2, split_repeats=5, regressor="ridge",
+            ridge_alpha=1.0, shuffle_repeats=1, seed=0, cross_splits="logo",
+        )
+        cell = results[0]
+        # One deterministic split per conversation, not split_repeats draws.
+        self.assertEqual(cell["n_probe_fits"], 4)
+        self.assertEqual(
+            [diag["n_evaluation"] for diag in cell["split_diagnostics"]], [4, 4, 4, 4]
+        )

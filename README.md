@@ -172,7 +172,7 @@ Every probe result is reported against:
 - **`context` probe cells** — for every layer, the same probe fitted on the **prompt-end activation** (before any reasoning token). This is the context-only baseline: the auditor-generated history itself carries persona/topic cues, so a CoT cell only demonstrates *incremental* predictive power by beating the context cell at the same layer. (Persona-vector work shows pooled correlations can be dominated by between-condition prompt differences [14] — this baseline separates them.)
 - **`prompt_mean`** — predict each prompt's training-rollout mean target. Meaningful for `within_prompt`; under cross-prompt holdout every evaluation prompt is unseen, so `prompt_mean` degenerates to `global_mean` there — use the context probe as the cross-prompt context baseline.
 - **`global_mean`** — predict the global training mean,
-- **`target_shuffled_probe`** — the identical probe refit on permuted targets, following the control-task methodology of Hewitt & Liang [4]. For cross-prompt evaluation the permutation is a **block permutation over conversations** (whole groups swap target blocks), preserving within-conversation target correlation so the control is not artificially easy to beat — the exchangeability-block / multi-level block permutation practice of permutation inference for clustered data [26]; for within-prompt it permutes rollouts inside each prompt.
+- **`target_shuffled_probe`** — the identical probe refit on permuted targets, following the control-task methodology of Hewitt & Liang [4]. For cross-prompt evaluation the permutation is a **block derangement over conversations** (whole groups swap target blocks; no group may keep its own), preserving within-conversation target correlation so the control is not artificially easy to beat — the exchangeability-block / multi-level block permutation practice of permutation inference for clustered data [26]; for within-prompt it permutes rollouts inside each prompt. The control reuses the α selected on the true targets (a mild conservatism; re-selecting per permutation would be the fully symmetric null).
 
 Metrics: **R²**, **MAE**, and **Pearson r** per target, plus persona-space macro averages — R² for continuous probe targets follows [5], MAE follows [2]. Repeated splits (`--split-repeats`) report mean ± std.
 
@@ -181,8 +181,10 @@ uv run analyze_persona_drift_probes.py \
     --activations results/behavioral_stability/Qwen3-32B/base_model/persona_drift/n50_nsamp8_l4096_gumbel_s42_ss42_t1.0_persona_activations.pt \
     --layers all --time-bins 4 \
     --splits cross_prompt,within_prompt \
-    --split-repeats 5 --shuffle-repeats 5
+    --split-repeats 5 --shuffle-repeats 5 \
+    --cross-splits logo
 ```
+`--cross-splits logo` (leave-one-group-out) holds every conversation out exactly once; with few conversations, independent random splits collapse to a couple of distinct draws and can leave some conversations never evaluated.
 
 The JSON report contains one entry per (split, layer, time-bin) with probe/baseline/control metrics and split diagnostics.
 

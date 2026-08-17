@@ -643,10 +643,11 @@ def _shuffle_rows(
     grouped_row_order = np.concatenate(
         [rows_by_group[group] for group in unique_groups]
     )
-    # Reject the identity permutation: with few groups it is drawn often
-    # (1/k! chance) and would contaminate the control with the real targets.
+    # Require a derangement (no group keeps its own block): with few groups,
+    # fixed points are drawn often and would leave part of the control aligned
+    # with the real targets.
     permutation = rng.permutation(unique_groups)
-    while len(unique_groups) > 1 and np.array_equal(permutation, unique_groups):
+    while len(unique_groups) > 1 and np.any(permutation == unique_groups):
         permutation = rng.permutation(unique_groups)
     permuted_blocks = np.concatenate(
         [targets[rows_by_group[group]] for group in permutation]
@@ -879,6 +880,7 @@ def run_analysis(
     ridge_alphas: Sequence[float] | None = None,
     cohort: str = "per_bin",
     include_context: bool = False,
+    cross_splits: str = "random",
 ) -> list[dict[str, Any]]:
     if time_bins < 1:
         raise ValueError("time_bins must be at least one")
@@ -888,6 +890,8 @@ def run_analysis(
         raise ValueError("split_repeats and shuffle_repeats must be at least one")
     if cohort not in {"per_bin", "fixed"}:
         raise ValueError(f"Unknown cohort mode: {cohort}")
+    if cross_splits not in {"random", "logo"}:
+        raise ValueError(f"Unknown cross_splits mode: {cross_splits}")
     if include_context and any(
         trajectory.context_activations is None for trajectory in trajectories
     ):
@@ -914,20 +918,35 @@ def run_analysis(
     split_plans: dict[str, list[SplitIndices]] = {}
     for split_offset, split_kind in enumerate(split_kinds):
         plans = []
-        for repeat in range(split_repeats):
-            split_seed = seed + 10_007 * repeat + 1_000_003 * split_offset
-            if split_kind == "cross_prompt":
+        if split_kind == "cross_prompt" and cross_splits == "logo":
+            # Leave-one-group-out: each group held out exactly once.  With few
+            # groups, independent random repeats collapse to a couple of
+            # distinct splits and can leave some groups never evaluated.
+            group_names = _split_group_names(trajectories, cross_group)
+            for group in np.unique(group_names):
                 plans.append(
-                    make_cross_prompt_split(
-                        trajectories, evaluation_fraction, split_seed, cross_group
+                    SplitIndices(
+                        train=np.flatnonzero(group_names != group),
+                        evaluation=np.flatnonzero(group_names == group),
                     )
                 )
-            elif split_kind == "within_prompt":
-                plans.append(
-                    make_within_prompt_split(trajectories, evaluation_fraction, split_seed)
-                )
-            else:
-                raise ValueError(f"Unknown split kind: {split_kind}")
+        else:
+            for repeat in range(split_repeats):
+                split_seed = seed + 10_007 * repeat + 1_000_003 * split_offset
+                if split_kind == "cross_prompt":
+                    plans.append(
+                        make_cross_prompt_split(
+                            trajectories, evaluation_fraction, split_seed, cross_group
+                        )
+                    )
+                elif split_kind == "within_prompt":
+                    plans.append(
+                        make_within_prompt_split(
+                            trajectories, evaluation_fraction, split_seed
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unknown split kind: {split_kind}")
         split_plans[split_kind] = plans
 
     results: list[dict[str, Any]] = []
@@ -1226,6 +1245,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shuffle-repeats", type=int, default=1)
     parser.add_argument(
+        "--cross-splits",
+        choices=("random", "logo"),
+        default="random",
+        help=(
+            "cross_prompt split plan: random repeated draws, or logo "
+            "(leave-one-group-out; each conversation/prompt held out exactly "
+            "once - recommended when groups are few)"
+        ),
+    )
+    parser.add_argument(
         "--cohort",
         choices=("per_bin", "fixed"),
         default="per_bin",
@@ -1323,6 +1352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         cohort=args.cohort,
         include_context=include_context,
+        cross_splits=args.cross_splits,
     )
 
     output = args.output or args.activations.with_name(
@@ -1346,6 +1376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ridge_alphas": ridge_alphas,
             "shuffle_repeats": args.shuffle_repeats,
             "cohort": args.cohort,
+            "cross_splits": args.cross_splits,
             "include_context": include_context,
             "seed": args.seed,
             "target_names": ["assistant_axis", *selected_names],
