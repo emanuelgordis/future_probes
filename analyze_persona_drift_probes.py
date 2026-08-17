@@ -662,7 +662,14 @@ def _select_ridge_alpha(
     alphas: Sequence[float],
     seed: int,
 ) -> float:
-    """Pick ridge alpha by grouped cross-validation on training data only."""
+    """Pick ridge alpha by grouped cross-validation on training data only.
+
+    Validation errors are normalized by each target's training variance so
+    large-scale targets (the axis) cannot dominate the selection over the
+    persona coordinates.  Ridge solutions are linear in each target, so target
+    scale affects only this selection objective, never the per-target fits at a
+    given alpha.
+    """
 
     if len(alphas) == 1:
         return float(alphas[0])
@@ -671,6 +678,8 @@ def _select_ridge_alpha(
     n_splits = min(3, len(np.unique(train_groups)))
     if n_splits < 2:
         return float(alphas[0])
+    target_scale = y_train.var(axis=0)
+    target_scale = np.where(target_scale > 1e-12, target_scale, 1.0)
     folds = list(GroupKFold(n_splits=n_splits).split(X_train, y_train, train_groups))
     best_alpha, best_error = float(alphas[0]), math.inf
     for alpha in alphas:
@@ -681,7 +690,8 @@ def _select_ridge_alpha(
             predictions = np.asarray(model.predict(X_train[validation_rows]))
             if predictions.ndim == 1:
                 predictions = predictions[:, None]
-            errors.append(float(np.mean((predictions - y_train[validation_rows]) ** 2)))
+            squared = (predictions - y_train[validation_rows]) ** 2
+            errors.append(float(np.mean(squared / target_scale)))
         error = float(np.mean(errors))
         if error < best_error:
             best_error, best_alpha = error, float(alpha)

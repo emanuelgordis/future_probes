@@ -140,6 +140,10 @@ def run_behavioral_stability(
             [int(token_id) for token_id in response.token_ids]
             for response in example_output.outputs
         ]
+        finish_reasons = [
+            str(response.finish_reason) if response.finish_reason is not None else None
+            for response in example_output.outputs
+        ]
         # Prefer the token ids vLLM actually consumed; fall back to the HF
         # chat-template tokenization (verified identical for Qwen3, which has
         # no BOS token) for engines that do not report prompt ids.
@@ -254,13 +258,15 @@ def run_behavioral_stability(
                 {
                     "response": response,
                     "token_ids": token_ids,
+                    "finish_reason": finish_reason,
                     "behavior": behavior,
                     "thinking_content": thinking_content,
                     "answer_content": answer_content,
                 }
-                for response, token_ids, behavior, thinking_content, answer_content in zip(
+                for response, token_ids, finish_reason, behavior, thinking_content, answer_content in zip(
                     responses,
                     response_token_ids,
+                    finish_reasons,
                     behaviors,
                     thinking_contents,
                     answer_contents,

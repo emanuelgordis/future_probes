@@ -441,3 +441,19 @@ class ControlsAndBaselinesTest(unittest.TestCase):
             self.assertFalse(
                 np.array_equal(shuffled, targets), f"identity at seed {seed}"
             )
+
+    def test_alpha_selection_invariant_to_target_rescaling(self):
+        from analyze_persona_drift_probes import _select_ridge_alpha
+
+        rng = np.random.default_rng(7)
+        n, d = 60, 8
+        X = rng.normal(size=(n, d))
+        groups = np.asarray([f"g{i % 3}" for i in range(n)], dtype=object)
+        # Target 0: strong linear signal; target 1: pure noise.
+        y = np.column_stack([X[:, 0] + 0.05 * rng.normal(size=n), rng.normal(size=n)])
+        alphas = [1e-3, 1.0, 1e3]
+        base = _select_ridge_alpha(X, y, groups, alphas, seed=0)
+        scaled = y.copy()
+        scaled[:, 1] *= 1000.0  # inflate the noise target's scale
+        rescaled = _select_ridge_alpha(X, scaled, groups, alphas, seed=0)
+        self.assertEqual(base, rescaled)

@@ -450,6 +450,27 @@ def gather_persona_drift_activations(
                     f"{outputs_file} lacks response token_ids (prompt {prompt_index}, "
                     f"rollout {rollout_index}); re-run unsteered_generation.py."
                 )
+            # A rollout cut off by the token budget has a truncated final
+            # answer; scoring partial answer text would corrupt the persona
+            # target.  finish_reason is authoritative when present; the length
+            # comparison covers outputs written before it was recorded.
+            finish_reason = response.get("finish_reason")
+            generation_cap = results.get("max_new_tokens")
+            if finish_reason == "length" or (
+                finish_reason is None
+                and generation_cap
+                and len(token_ids) >= int(generation_cap)
+            ):
+                skipped.append(
+                    {
+                        "prompt_index": prompt_index,
+                        "conversation_id": metadata.get("conversation_id"),
+                        "turn_index": metadata.get("turn_index"),
+                        "rollout_index": rollout_index,
+                        "reason": "generation hit the token budget (truncated answer)",
+                    }
+                )
+                continue
             try:
                 rollouts.append(
                     build_rollout_record(
